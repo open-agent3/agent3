@@ -449,7 +449,7 @@ pub async fn dispatch_ui_tool(app: &AppHandle, name: &str, args_json: &str) -> S
             if keyword.is_empty() {
                 return "Error: keyword is empty".to_string();
             }
-            let limit = args["limit"].as_i64().unwrap_or(10).min(30).max(1) as usize;
+            let limit = args["limit"].as_i64().unwrap_or(10).clamp(1, 30) as usize;
             let db_state = app.state::<DbState>();
             let pool = &db_state.0;
             match crate::db::search_kg_subgraph(pool, keyword, limit).await {

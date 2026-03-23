@@ -242,6 +242,7 @@ enum ConnectMode {
     ToolRetry,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn session_loop(
     app: AppHandle,
     protocol: Box<dyn realtime_ws::RealtimeProtocol>,
@@ -698,6 +699,7 @@ async fn session_loop(
 }
 
 /// Event loop core — handles audio I/O, WS events, tool execution, and inject commands
+#[allow(clippy::too_many_arguments)]
 async fn run_event_loop(
     app: &AppHandle,
     protocol: &dyn realtime_ws::RealtimeProtocol,
@@ -962,6 +964,7 @@ async fn run_event_loop(
 
 /// Handle a single WS message — audio playback + transcript forwarding + tool call dispatch
 /// Returns (replies, optional_exit): replies need to be sent back via WS, optional_exit carries reconnect signal when change_voice is triggered
+#[allow(clippy::too_many_arguments)]
 async fn handle_ws_message(
     app: &AppHandle,
     protocol: &dyn realtime_ws::RealtimeProtocol,

@@ -133,15 +133,12 @@ pub fn run() {
             agent::wakeword::wakeword_delete,
             agent::wakeword::wakeword_set_active,
         ])
-        .menu(|handle| Menu::new(handle))
+        .menu(Menu::new)
         .setup(|app| {
             // Initialize SQLite database
             let app_handle = app.handle().clone();
             let pool = tauri::async_runtime::block_on(db::init_db(&app_handle)).map_err(|e| {
-                tauri::Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
+                tauri::Error::Io(std::io::Error::other(e.to_string()))
             })?;
             app.manage(db::DbState(pool));
 

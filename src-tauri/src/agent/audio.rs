@@ -358,6 +358,7 @@ fn to_mono_i16(data: &[i16], channels: usize) -> Vec<i16> {
 // Async processing loop
 // ============================================================
 
+#[allow(clippy::too_many_arguments)]
 async fn process_loop(
     app: AppHandle,
     mut raw_rx: mpsc::Receiver<Vec<i16>>,
@@ -541,7 +542,7 @@ async fn process_loop(
                 static DROP_COUNT: std::sync::atomic::AtomicUsize =
                     std::sync::atomic::AtomicUsize::new(0);
                 let count = DROP_COUNT.fetch_add(1, Ordering::Relaxed);
-                if count % 500 == 0 {
+                if count.is_multiple_of(500) {
                     log::warn!(
                         "[Audio] Dropped audio frame (channel full), total: {}",
                         count + 1
@@ -578,13 +579,15 @@ fn create_detector(sample_rate: u32, model_path: Option<&str>) -> Option<rustpot
         return None;
     }
 
-    let mut config = RustpotterConfig::default();
-    config.fmt = WavFmt {
-        sample_rate: sample_rate as usize,
-        sample_format: hound::SampleFormat::Int,
-        bits_per_sample: 16,
-        channels: 1,
-        endianness: Endianness::Little,
+    let mut config = RustpotterConfig {
+        fmt: WavFmt {
+            sample_rate: sample_rate as usize,
+            sample_format: hound::SampleFormat::Int,
+            bits_per_sample: 16,
+            channels: 1,
+            endianness: Endianness::Little,
+        },
+        ..Default::default()
     };
     // Enable gain normalization to improve detection consistency across different microphones/volumes
     config.filters.gain_normalizer.enabled = true;

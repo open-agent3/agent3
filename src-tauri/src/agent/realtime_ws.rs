@@ -254,7 +254,7 @@ fn detect_proxy(target_url: &str) -> Option<String> {
     let proxy = env_proxy
         .filter(|s| !s.is_empty())
         // 2. Fallback: Windows registry system proxy
-        .or_else(|| read_windows_system_proxy())
+        .or_else(read_windows_system_proxy)
         .filter(|s| !s.is_empty())?;
 
     log::info!("[RealtimeWS] Detected proxy: {}", proxy);
@@ -263,7 +263,7 @@ fn detect_proxy(target_url: &str) -> Option<String> {
     let no_proxy = std::env::var("NO_PROXY")
         .or_else(|_| std::env::var("no_proxy"))
         .ok()
-        .or_else(|| read_windows_proxy_override());
+        .or_else(read_windows_proxy_override);
 
     if let Some(no_proxy) = no_proxy {
         if let Some((host, _)) = parse_host_port(target_url) {
@@ -335,14 +335,14 @@ fn read_windows_system_proxy() -> Option<String> {
         // Protocol-specific format, extract https or http
         for segment in proxy_value.split(';') {
             let segment = segment.trim();
-            if segment.starts_with("https=") {
-                return Some(format!("http://{}", &segment[6..]));
+            if let Some(stripped) = segment.strip_prefix("https=") {
+                return Some(format!("http://{}", stripped));
             }
         }
         for segment in proxy_value.split(';') {
             let segment = segment.trim();
-            if segment.starts_with("http=") {
-                return Some(format!("http://{}", &segment[5..]));
+            if let Some(stripped) = segment.strip_prefix("http=") {
+                return Some(format!("http://{}", stripped));
             }
         }
         None
