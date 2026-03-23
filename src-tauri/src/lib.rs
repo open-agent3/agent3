@@ -267,11 +267,12 @@ pub fn run() {
                 let _ = window.set_position(tauri::LogicalPosition::new(0.0, 0.0));
             }
 
-            // Click-through
-            window.set_ignore_cursor_events(true)?;
-
-            // Show window after ready to avoid white flash
+            // Show window first — on Linux/GTK the underlying GdkWindow must
+            // exist before input_shape_combine_region can be called.
             let _ = window.show();
+
+            // Click-through (must be after show on Linux)
+            window.set_ignore_cursor_events(true)?;
 
             // Sync autostart state with saved setting (default: enabled)
             {
