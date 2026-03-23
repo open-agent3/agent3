@@ -33,7 +33,7 @@ urlencoding = "2"
 open = "5"
 reqwest = { version = "0.12", features = ["json", "stream", "native-tls-vendored"] }
 uuid = { version = "1", features = ["v4"] }
-xcap = "0.0.13"
+xcap = "0.9"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 cpal = "0.15"
 rustpotter = { git = "https://github.com/GiviMAD/rustpotter", tag = "v2.0.0" }

@@ -186,7 +186,7 @@ pub fn capture_screen() -> Result<ScreenCapture, String> {
     let monitors = xcap::Monitor::all().map_err(|e| format!("Failed to list monitors: {}", e))?;
     let monitor = monitors
         .into_iter()
-        .find(|m| m.is_primary())
+        .find(|m| m.is_primary().unwrap_or(false))
         .or_else(|| xcap::Monitor::all().ok().and_then(|m| m.into_iter().next()))
         .ok_or("No monitor found")?;
 
