@@ -1,0 +1,1265 @@
+/// session — Voice I/O + direct tool execution via Realtime API WebSocket
+///
+/// The session layer handles:
+/// 1. Managing Realtime API WebSocket connection lifecycle
+/// 2. Native audio I/O (cpal capture → WS → cpal playback)
+/// 3. All function calling — tools are registered on the WS session and executed locally
+/// 4. Persisting transcripts/tool results via MemoryStore
+use crate::agent::audio::{self, WakeEvent, WakeState};
+use crate::agent::memory::MemoryStore;
+use crate::agent::playback::PlaybackCommand;
+use crate::agent::{realtime_ws, subagents, task_manager, tools};
+use crate::db::DbState;
+use futures_util::{SinkExt, StreamExt};
+use serde::Serialize;
+use serde_json::Value;
+use std::sync::{atomic::Ordering, Arc};
+use tauri::{AppHandle, Emitter, Manager};
+use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::Message;
+
+/// Maximum consecutive tool-triggered response rounds before forcing the model to stop calling tools
+const MAX_TOOL_ROUNDS: usize = 10;
+
+// ============================================================
+// Event payloads (emitted to frontend)
+// ============================================================
+
+#[derive(Clone, Serialize)]
+pub struct TranscriptPayload {
+    pub role: String,
+    pub text: String,
+}
+
+#[derive(Clone, Serialize)]
+pub struct StatusPayload {
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+// ============================================================
+// Control commands
+// ============================================================
+
+pub enum SessionCommand {
+    Stop,
+    /// Switch voice and reconnect WebSocket
+    Reconnect(String),
+    /// Graceful disconnect after AI farewell
+    Disconnect,
+    /// Wake from sleep (global shortcut)
+    Wake,
+}
+
+// ============================================================
+// Session Handle — holds channel senders and task handle
+// ============================================================
+
+pub struct SessionHandle {
+    pub cmd_tx: mpsc::Sender<SessionCommand>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl SessionHandle {
+    pub async fn stop(self) {
+        let _ = self.cmd_tx.send(SessionCommand::Stop).await;
+        let _ = self.task.await;
+    }
+}
+
+/// Build the full list of tools to register on the Realtime WS session.
+/// Combines AGENT_TOOLS_JSON (system tools) + change_voice tool.
+fn build_ws_tools(wakeword_enabled: bool) -> Vec<Value> {
+    let mut all_tools: Vec<Value> =
+        serde_json::from_str(tools::AGENT_TOOLS_JSON).unwrap_or_default();
+    if !wakeword_enabled {
+        all_tools.retain(|t| t["name"].as_str() != Some("disconnect_session"));
+    }
+    // Add change_voice tool (handled specially in pipeline, not dispatched via task_manager)
+    all_tools.push(serde_json::json!({
+        "type": "function",
+        "name": "change_voice",
+        "description": "Call when the user asks to change your voice, tone, or timbre. Examples: 'switch to a male voice', 'use a deeper voice'.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "voice_name": {
+                    "type": "string",
+                    "description": "Target voice name"
+                }
+            },
+            "required": ["voice_name"]
+        }
+    }));
+    all_tools
+}
+
+// ============================================================
+// Start session
+// ============================================================
+
+pub async fn start(
+    app: AppHandle,
+    inject_rx: mpsc::Receiver<String>,
+    audio_rx: mpsc::Receiver<String>,
+    wake_rx: mpsc::Receiver<WakeEvent>,
+    flags: Arc<audio::SharedAudioFlags>,
+    playback_tx: mpsc::Sender<PlaybackCommand>,
+    wakeword_enabled: bool,
+) -> Result<SessionHandle, String> {
+    // Read realtime provider from DB
+    let db_state = app.state::<DbState>();
+    let pool = &db_state.0;
+
+    let provider = sqlx::query_as::<_, (String, String, String, String, String, String)>(
+        "SELECT id, name, base_url, api_key, model, provider_type FROM llm_providers WHERE is_active = 1 AND role IN ('realtime', 'sensory') LIMIT 1"
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+
+    let v: Option<String> = sqlx::query_scalar("SELECT value FROM app_settings WHERE key = 'voice_name'")
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+
+    let onboarded: Option<String> = sqlx::query_scalar("SELECT value FROM app_settings WHERE key = 'voice_onboarded'")
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+
+    let (provider_info, voice, is_voice_onboarded) = (
+        provider,
+        v.unwrap_or_default(),
+        onboarded.map(|o| o == "true" || o == "1").unwrap_or(false),
+    );
+
+    let (_id, name, base_url, api_key, model, provider_type_str) = match provider_info {
+        Some(p) => p,
+        None => {
+            if let Err(e) = app.emit(
+                "agent-status",
+                StatusPayload {
+                    state: "no-provider".into(),
+                    message: Some(crate::i18n::t("status.no_provider")),
+                },
+            ) {
+                log::warn!("[Session] Emit event error: {}", e);
+            }
+            return Err("No active realtime provider configured".into());
+        }
+    };
+
+    if api_key.is_empty() {
+        if let Err(e) = app.emit(
+            "agent-status",
+            StatusPayload {
+                state: "no-provider".into(),
+                message: Some(crate::i18n::t("status.no_api_key")),
+            },
+        ) {
+            log::warn!("[Session] Emit event error: {}", e);
+        }
+        return Err("API key is empty".into());
+    }
+
+    let protocol = realtime_ws::protocol_for(&provider_type_str);
+
+    // Build full tool list for the WS session (all system tools + change_voice)
+    let ws_tools = if protocol.supports_function_calling() {
+        build_ws_tools(wakeword_enabled)
+    } else {
+        vec![]
+    };
+
+    log::info!(
+        "[Session] Starting with provider: {} (type={}, model={}, tools={}, voice={})",
+        name,
+        provider_type_str,
+        model,
+        ws_tools.len(),
+        if voice.is_empty() {
+            "(default)"
+        } else {
+            &voice
+        },
+    );
+
+    let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(4);
+
+    let task = tokio::spawn(session_loop(
+        app.clone(),
+        protocol,
+        api_key,
+        base_url,
+        model,
+        voice,
+        is_voice_onboarded,
+        ws_tools,
+        audio_rx,
+        cmd_rx,
+        inject_rx,
+        wake_rx,
+        flags,
+        playback_tx,
+    ));
+
+    Ok(SessionHandle { cmd_tx, task })
+}
+
+// ============================================================
+// Core event loop
+// ============================================================
+
+/// Event loop exit reason
+enum LoopExit {
+    /// WS disconnected (needs reconnection)
+    Disconnected,
+    /// WS disconnected due to Gemini 1008 (audio+tool conflict) — needs retry with tool-only hint
+    Disconnected1008,
+    /// Received Stop command
+    Stopped,
+    /// Wake timeout (return to sleep); carries user turn count for consolidation
+    WakeTimeout(usize),
+    /// Voice switch reconnection (carries new voice name)
+    Reconnect(String),
+}
+
+/// How we're connecting this iteration — determines greeting + context injection behavior
+#[derive(Clone, PartialEq)]
+enum ConnectMode {
+    /// New session: wakeword or scheduled task. Greeting + system-instruction summary only.
+    NewSession,
+    /// Voice switch: greeting FIRST (clean context), then inject raw history for follow-up.
+    VoiceSwitch,
+    /// WS error reconnect: inject raw history only, no greeting (seamless continuation).
+    SilentReconnect,
+    /// Retry after Gemini 1008 crash: inject history + tool-only hint to complete the failed action.
+    ToolRetry,
+}
+
+async fn session_loop(
+    app: AppHandle,
+    protocol: Box<dyn realtime_ws::RealtimeProtocol>,
+    api_key: String,
+    base_url: String,
+    model: String,
+    mut voice: String,
+    mut is_voice_onboarded: bool,
+    ws_tools: Vec<Value>,
+    mut audio_rx: mpsc::Receiver<String>,
+    mut cmd_rx: mpsc::Receiver<SessionCommand>,
+    mut inject_rx: mpsc::Receiver<String>,
+    mut wake_rx: mpsc::Receiver<WakeEvent>,
+    flags: Arc<audio::SharedAudioFlags>,
+    playback_tx: mpsc::Sender<PlaybackCommand>,
+) {
+    let memory = MemoryStore::new(app.clone());
+    let (subagent_event_tx, mut subagent_event_rx) = mpsc::channel::<subagents::SubagentEvent>(64);
+    let subagent_mgr = subagents::SubagentManager::new(app.clone(), subagent_event_tx);
+    let mut first_boot = true;
+    'outer: loop {
+        // ── Phase 1: Wait for wake signal ──
+        let mut connect_mode = ConnectMode::NewSession;
+        let mut scheduled_task_desc: Option<String> = None;
+        flags.session_state.store(0, Ordering::Relaxed); // 0 = sleeping
+
+        // On first boot, skip waiting for wakeword — connect immediately
+        if first_boot {
+            first_boot = false;
+            log::info!("[Session] First boot — connecting immediately");
+        } else {
+            log::info!("[Session] Waiting for wake event\u{2026}");
+            if let Err(e) = app.emit(
+                "agent-status",
+                StatusPayload {
+                    state: "sleeping".into(),
+                    message: None,
+                },
+            ) {
+                log::warn!("[Session] Emit event error: {}", e);
+            }
+
+            loop {
+                tokio::select! {
+                    wake = wake_rx.recv() => {
+                        match wake {
+                            Some(WakeEvent::Detected) => {
+                                log::info!("[Session] Wake event received, connecting\u{2026}");
+                                break;
+                            }
+                            Some(WakeEvent::ScheduledTask(desc)) => {
+                                log::info!("[Session] Scheduled task wake: {}", desc);
+                                scheduled_task_desc = Some(desc);
+                                break;
+                            }
+                            Some(WakeEvent::Timeout) => {} // Timeout in waiting phase is meaningless, ignore
+                            None => break 'outer,
+                        }
+                    }
+                    cmd = cmd_rx.recv() => {
+                        match cmd {
+                            Some(SessionCommand::Stop) | None => break 'outer,
+                            Some(SessionCommand::Reconnect(new_voice)) => {
+                                // Voice switch while sleeping — wake up and connect with new voice
+                                log::info!("[Session] Voice switch while sleeping: {}", new_voice);
+                                voice = new_voice;
+                                connect_mode = ConnectMode::VoiceSwitch;
+                                break;
+                            }
+                            Some(SessionCommand::Wake) => {
+                                log::info!("[Session] Manual wake (global shortcut)");
+                                break;
+                            }
+                            Some(SessionCommand::Disconnect) => {} // Already sleeping, ignore
+                        }
+                    }
+                }
+            }
+        } // end else (not first_boot)
+
+        // ── Phase 2: Connect + event loop (with auto-reconnection) ──
+        'conn: loop {
+            let ws = match realtime_ws::connect(protocol.as_ref(), &api_key, &base_url, &model)
+                .await
+            {
+                Ok(ws) => ws,
+                Err(e) => {
+                    log::error!("[Session] Connect failed: {}", e);
+                    if let Err(e) = app.emit(
+                        "agent-status",
+                        StatusPayload {
+                            state: "error".into(),
+                            message: Some(format!(
+                                "{}: {}",
+                                crate::i18n::t("status.connection_failed"),
+                                e
+                            )),
+                        },
+                    ) {
+                        log::warn!("[Session] Emit event error: {}", e);
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => continue 'conn,
+                        cmd = cmd_rx.recv() => {
+                            if matches!(cmd, Some(SessionCommand::Stop) | None) { break 'outer; }
+                            continue 'conn;
+                        }
+                        wake = wake_rx.recv() => {
+                            if matches!(wake, Some(WakeEvent::Timeout)) { break 'conn; }
+                            continue 'conn;
+                        }
+                    }
+                }
+            };
+
+            let (mut ws_sink, mut ws_stream) = ws.split();
+
+            // Send session.update / setup
+            let mut instructions = memory.build_instructions().await.unwrap_or_default();
+            let voice_prompt = protocol.supported_voices_prompt();
+            if !voice_prompt.is_empty() {
+                instructions.push_str("\n\nVOICE CAPABILITIES:\n");
+                instructions.push_str(&voice_prompt);
+            }
+
+            let session_update =
+                protocol.build_session_update(&instructions, &ws_tools, &model, &voice);
+            let setup_preview: String = session_update.to_string().chars().take(300).collect();
+            log::info!("[Session] Sending setup: {}...", setup_preview);
+            if let Err(e) = ws_sink
+                .send(Message::Text(session_update.to_string().into()))
+                .await
+            {
+                log::error!("[Session] Failed to send session.update: {}", e);
+                continue 'conn;
+            }
+
+            // Gemini requires waiting for setupComplete before sending data
+            if protocol.requires_setup_ack() {
+                let ack_timeout = tokio::time::sleep(std::time::Duration::from_secs(10));
+                tokio::pin!(ack_timeout);
+                let mut got_ack = false;
+                loop {
+                    tokio::select! {
+                        _ = &mut ack_timeout => {
+                            log::error!("[Session] Timed out waiting for setupComplete");
+                            break;
+                        }
+                        ws_msg = ws_stream.next() => {
+                            let raw_text = match &ws_msg {
+                                Some(Ok(Message::Text(t))) => Some(t.to_string()),
+                                Some(Ok(Message::Binary(b))) => std::str::from_utf8(b).ok().map(|s| s.to_string()),
+                                _ => None,
+                            };
+                            if let Some(raw) = raw_text {
+                                if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+                                    if v.get("setupComplete").is_some() {
+                                        log::info!("[Session] Received setupComplete");
+                                        got_ack = true;
+                                        break;
+                                    }
+                                    log::debug!("[Session] While waiting for setupComplete, got: {}", &raw[..raw.len().min(120)]);
+                                }
+                            } else if let Some(Ok(Message::Close(close_frame))) = &ws_msg {
+                                log::warn!("[Session] WebSocket closed while waiting for setupComplete. Frame: {:?}", close_frame);
+                                break;
+                            } else if ws_msg.is_none() {
+                                log::warn!("[Session] WebSocket closed while waiting for setupComplete (None)");
+                                break;
+                            }
+                        }
+                        cmd = cmd_rx.recv() => {
+                            if matches!(cmd, Some(SessionCommand::Stop) | None) { break 'outer; }
+                        }
+                    }
+                }
+                if !got_ack {
+                    continue 'conn;
+                }
+            }
+
+            // Switch state to Listening
+            flags
+                .wake_state
+                .store(WakeState::Listening as u8, Ordering::Relaxed);
+            flags.session_state.store(2, Ordering::Relaxed); // 2 = connected
+            app.emit("agent-wake-state", "listening").ok();
+
+            if let Err(e) = app.emit(
+                "agent-status",
+                StatusPayload {
+                    state: "connected".into(),
+                    message: None,
+                },
+            ) {
+                log::warn!("[Session] Emit event error: {}", e);
+            }
+
+            // Context injection + greeting strategy depends on connect mode:
+            // - VoiceSwitch: greeting FIRST (so AI responds with a proper greeting
+            //   against a clean conversation), THEN inject raw history for follow-up.
+            // - SilentReconnect: inject raw history only, no greeting.
+            // - NewSession: greeting only (history is in system instructions as summary).
+            match connect_mode {
+                ConnectMode::VoiceSwitch => {
+                    // Greeting only — system instructions already contain last_session_summary
+                    // so the AI has enough context without raw message injection (which would
+                    // corrupt the conversation state by appending old messages after the greeting).
+                    let greeting = memory.contextual_greeting("voice_switch", None);
+                    log::info!("[Session] Voice switch: injecting greeting");
+                    let greeting_msg = protocol.inject_speech_msg(&greeting);
+                    if let Err(e) = ws_sink.send(Message::Text(greeting_msg.into())).await {
+                        log::error!("[Session] Failed to inject greeting: {}", e);
+                        continue 'conn;
+                    }
+                }
+                ConnectMode::SilentReconnect => {
+                    // Inject raw history only — seamless continuation after WS error
+                    let context = memory.recent_context(20).await.unwrap_or_default();
+                    if !context.is_empty() {
+                        log::info!(
+                            "[Session] Silent reconnect: injecting {} messages",
+                            context.len()
+                        );
+                        for (role, text) in &context {
+                            if let Some(msg) = protocol.conversation_inject_msg(role, text) {
+                                if let Err(e) = ws_sink.send(Message::Text(msg.into())).await {
+                                    log::error!("[Session] Failed to inject context: {}", e);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                ConnectMode::ToolRetry => {
+                    // Gemini 1008 recovery: inject history + explicit tool-only retry hint
+                    let context = memory.recent_context(20).await.unwrap_or_default();
+                    if !context.is_empty() {
+                        log::info!(
+                            "[Session] Tool retry (1008 recovery): injecting {} messages + retry hint",
+                            context.len()
+                        );
+                        for (role, text) in &context {
+                            if let Some(msg) = protocol.conversation_inject_msg(role, text) {
+                                if let Err(e) = ws_sink.send(Message::Text(msg.into())).await {
+                                    log::error!("[Session] Failed to inject context: {}", e);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    // Inject a system hint telling the model to silently complete the pending tool call
+                    let retry_hint = "[System] Your previous response was interrupted because you tried to speak and call a tool at the same time. This time, ONLY execute the tool/function call silently — do NOT generate any spoken audio. After the tool result comes back, you may speak to the user.";
+                    let hint_msg = protocol.inject_speech_msg(retry_hint);
+                    if let Err(e) = ws_sink.send(Message::Text(hint_msg.into())).await {
+                        log::error!("[Session] Failed to inject tool retry hint: {}", e);
+                        continue 'conn;
+                    }
+                }
+                ConnectMode::NewSession => {
+                    // Greeting only — history is already in system instructions as summary
+                    let greeting = if !is_voice_onboarded {
+                        // Mark as onboarded in memory so we don't ask again if we reconnect in this session
+                        is_voice_onboarded = true;
+
+                        "First boot. Give a warm one-to-one introduction. Avoid group/broadcast-style wording. Tell the user you can switch voice. Ask whether they want to switch now. If they want to switch, wait for their answer then call `change_voice`. If they keep current voice, call `set_agent_config` with key 'voice_onboarded' and value 'true'. IMPORTANT: when calling a tool/function (such as change_voice or set_agent_config), do not generate spoken text/audio in the same response round; execute the tool silently."
+                        .to_string()
+                    } else if let Some(ref desc) = scheduled_task_desc {
+                        memory.contextual_greeting("scheduled_task", Some(desc))
+                    } else {
+                        memory.contextual_greeting("wakeword", None)
+                    };
+                    log::info!("[Session] New session: injecting greeting");
+                    let greeting_msg = protocol.inject_speech_msg(&greeting);
+                    if let Err(e) = ws_sink.send(Message::Text(greeting_msg.into())).await {
+                        log::error!("[Session] Failed to inject greeting: {}", e);
+                        continue 'conn;
+                    }
+                }
+            }
+
+            // Create task manager for tool execution
+            let (task_event_tx, task_event_rx) = mpsc::channel::<task_manager::TaskEvent>(64);
+            let task_mgr = task_manager::TaskManager::new(app.clone(), task_event_tx);
+
+            // Main event loop
+            let exit = run_event_loop(
+                &app,
+                protocol.as_ref(),
+                &mut ws_sink,
+                &mut ws_stream,
+                &mut audio_rx,
+                &mut cmd_rx,
+                &memory,
+                &mut inject_rx,
+                &mut wake_rx,
+                &playback_tx,
+                task_mgr,
+                task_event_rx,
+                &flags,
+                &subagent_mgr,
+                &mut subagent_event_rx,
+            )
+            .await;
+
+            // Close WS — clear speaking flag so mic reopens
+            flags.is_ai_speaking.store(false, Ordering::Relaxed);
+            flags.session_state.store(0, Ordering::Relaxed); // 0 = sleeping
+            let _ = ws_sink.close().await;
+            log::info!("[Session] Disconnected");
+
+            // Emit lifecycle event
+            let reason = match &exit {
+                LoopExit::WakeTimeout(_) => "timeout",
+                LoopExit::Stopped => "stopped",
+                LoopExit::Reconnect(_) => "voice_switch",
+                LoopExit::Disconnected => "disconnected",
+                LoopExit::Disconnected1008 => "disconnected_1008",
+            };
+            app.emit(
+                "session-lifecycle",
+                serde_json::json!({
+                    "event": "disconnected",
+                    "reason": reason,
+                }),
+            )
+            .ok();
+
+            match exit {
+                LoopExit::WakeTimeout(user_turns) => {
+                    log::info!(
+                        "[Session] Wake timeout — returning to sleep (user_turns={})",
+                        user_turns
+                    );
+
+                    // Post-session memory consolidation: if meaningful conversation happened,
+                    // spawn a background subagent to extract key facts
+                    if user_turns >= 3 {
+                        let context = memory.recent_context(20).await.unwrap_or_default();
+                        if !context.is_empty() {
+                            let conversation_text: String = context
+                                .iter()
+                                .filter(|(role, _)| role == "user" || role == "assistant")
+                                .map(|(role, content)| {
+                                    let label = if role == "user" { "User" } else { "Assistant" };
+                                    format!("{}: {}", label, content)
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            let goal = format!(
+                                "Review this conversation and extract key facts worth remembering about the user. \
+                                 For each important fact (personal info, preferences, habits, requests), \
+                                 call remember_fact with a concise statement. \
+                                 Only store NEW information — skip greetings and small talk.\n\n\
+                                 Conversation:\n{}",
+                                conversation_text
+                            );
+                            match subagent_mgr.spawn(&goal).await {
+                                Ok(task_id) => log::info!(
+                                    "[Session] Spawned memory consolidation subagent: {}",
+                                    task_id
+                                ),
+                                Err(e) => log::warn!(
+                                    "[Session] Failed to spawn consolidation subagent: {}",
+                                    e
+                                ),
+                            }
+                        }
+                    }
+
+                    break 'conn; // Return to Phase 1 to wait for wake
+                }
+                LoopExit::Stopped => break 'outer,
+                LoopExit::Reconnect(new_voice) => {
+                    log::info!("[Session] Switching voice to: {}", new_voice);
+                    if let Err(e) = app.emit(
+                        "agent-status",
+                        StatusPayload {
+                            state: "switching-voice".into(),
+                            message: Some(format!(
+                                "{}: {}",
+                                crate::i18n::t("status.switching_voice"),
+                                new_voice
+                            )),
+                        },
+                    ) {
+                        log::warn!("[Session] Emit event error: {}", e);
+                    }
+                    voice = new_voice;
+                    connect_mode = ConnectMode::VoiceSwitch;
+                    continue 'conn; // Reconnect directly with new voice
+                }
+                LoopExit::Disconnected => {
+                    if let Err(e) = app.emit(
+                        "agent-status",
+                        StatusPayload {
+                            state: "disconnected".into(),
+                            message: Some(crate::i18n::t("status.reconnecting")),
+                        },
+                    ) {
+                        log::warn!("[Session] Emit event error: {}", e);
+                    }
+                    log::info!("[Session] Disconnected, reconnecting in 3s\u{2026}");
+                    connect_mode = ConnectMode::SilentReconnect;
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => continue 'conn,
+                        cmd = cmd_rx.recv() => {
+                            if matches!(cmd, Some(SessionCommand::Stop) | None) { break 'outer; }
+                            continue 'conn;
+                        }
+                        wake = wake_rx.recv() => {
+                            if matches!(wake, Some(WakeEvent::Timeout)) { break 'conn; }
+                            continue 'conn;
+                        }
+                    }
+                }
+                LoopExit::Disconnected1008 => {
+                    log::warn!("[Session] Gemini 1008 crash (audio+tool conflict) — retrying with tool-only mode in 2s");
+                    if let Err(e) = app.emit(
+                        "agent-status",
+                        StatusPayload {
+                            state: "disconnected".into(),
+                            message: Some(crate::i18n::t("status.reconnecting")),
+                        },
+                    ) {
+                        log::warn!("[Session] Emit event error: {}", e);
+                    }
+                    connect_mode = ConnectMode::ToolRetry;
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => continue 'conn,
+                        cmd = cmd_rx.recv() => {
+                            if matches!(cmd, Some(SessionCommand::Stop) | None) { break 'outer; }
+                            continue 'conn;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Session fully stopped — abort all background subagents
+    subagent_mgr.abort_all();
+
+    if let Err(e) = app.emit(
+        "agent-status",
+        StatusPayload {
+            state: "stopped".into(),
+            message: None,
+        },
+    ) {
+        log::warn!("[Session] Emit event error: {}", e);
+    }
+    log::info!("[Session] Stopped");
+}
+
+/// Event loop core — handles audio I/O, WS events, tool execution, and inject commands
+async fn run_event_loop(
+    app: &AppHandle,
+    protocol: &dyn realtime_ws::RealtimeProtocol,
+    ws_sink: &mut futures_util::stream::SplitSink<realtime_ws::WsStream, Message>,
+    ws_stream: &mut futures_util::stream::SplitStream<realtime_ws::WsStream>,
+    audio_rx: &mut mpsc::Receiver<String>,
+    cmd_rx: &mut mpsc::Receiver<SessionCommand>,
+    memory: &MemoryStore,
+    inject_rx: &mut mpsc::Receiver<String>,
+    wake_rx: &mut mpsc::Receiver<WakeEvent>,
+    playback_tx: &mpsc::Sender<PlaybackCommand>,
+    task_mgr: task_manager::TaskManager,
+    mut task_rx: mpsc::Receiver<task_manager::TaskEvent>,
+    flags: &Arc<audio::SharedAudioFlags>,
+    subagent_mgr: &subagents::SubagentManager,
+    subagent_rx: &mut mpsc::Receiver<subagents::SubagentEvent>,
+) -> LoopExit {
+    // Accumulate transcript delta, send complete text to memory on ResponseDone
+    let mut transcript_buf = String::new();
+    // Pending tool calls accumulated within a single response (batch submit on ResponseDone)
+    let mut pending_tool_calls: Vec<task_manager::TaskRequest> = Vec::new();
+    // Number of outstanding tools being executed
+    let mut tools_in_flight: usize = 0;
+    // Safety: count consecutive tool-triggered response rounds to prevent infinite loops
+    let mut consecutive_tool_rounds: usize = 0;
+    // Count user transcript turns for post-session consolidation guard
+    let mut user_turn_count: usize = 0;
+    // Guard for per-connection wakeword nudge check to avoid repeated DB queries.
+    let mut wakeword_nudge_checked: bool = false;
+
+    loop {
+        tokio::select! {
+            // Native Rust audio → WS
+            audio = audio_rx.recv() => {
+                match audio {
+                    Some(base64) => {
+                        let msg = protocol.audio_append_msg(&base64);
+                        if let Err(e) = ws_sink.send(Message::Text(msg.into())).await {
+                            log::error!("[Session] Failed to send audio: {}", e);
+                            return LoopExit::Disconnected;
+                        }
+                    }
+                    None => {
+                        return LoopExit::Stopped;
+                    }
+                }
+            }
+
+            // Wake timeout
+            wake = wake_rx.recv() => {
+                if matches!(wake, Some(WakeEvent::Timeout)) {
+                    task_mgr.abort_all();
+                    return LoopExit::WakeTimeout(user_turn_count);
+                }
+            }
+
+            // WS message — dispatch
+            ws_msg = ws_stream.next() => {
+                match ws_msg {
+                    Some(Ok(Message::Text(raw))) => {
+                        let preview: String = raw.chars().take(200).collect();
+                        log::debug!("[Session] WS Text: {}", preview);
+                        let (replies, exit) = handle_ws_message(
+                            app, protocol, memory, playback_tx,
+                            &raw, &mut transcript_buf, &mut pending_tool_calls,
+                            &task_mgr, &mut tools_in_flight,
+                            &mut consecutive_tool_rounds,
+                            flags,
+                            subagent_mgr,
+                            &mut user_turn_count,
+                            &mut wakeword_nudge_checked,
+                        ).await;
+                        for reply in replies {
+                            if let Err(e) = ws_sink.send(Message::Text(reply.into())).await {
+                                log::error!("[Session] Failed to send reply: {}", e);
+                                return LoopExit::Disconnected;
+                            }
+                        }
+                        if let Some(e) = exit {
+                            return e;
+                        }
+                    }
+                    Some(Ok(Message::Binary(data))) => {
+                        log::debug!("[Session] WS Binary frame: {} bytes", data.len());
+                        if let Ok(text) = std::str::from_utf8(&data) {
+                            let (replies, exit) = handle_ws_message(
+                                app, protocol, memory, playback_tx,
+                                text, &mut transcript_buf, &mut pending_tool_calls,
+                                &task_mgr, &mut tools_in_flight,
+                                &mut consecutive_tool_rounds,
+                                flags,
+                                subagent_mgr,
+                                &mut user_turn_count,
+                                &mut wakeword_nudge_checked,
+                            ).await;
+                            for reply in replies {
+                                if let Err(e) = ws_sink.send(Message::Text(reply.into())).await {
+                                    log::error!("[Session] Failed to send reply: {}", e);
+                                    return LoopExit::Disconnected;
+                                }
+                            }
+                            if let Some(e) = exit {
+                                return e;
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Close(frame))) => {
+                        if let Some(f) = frame.as_ref() {
+                            log::info!("[Session] WebSocket closed: code={}, reason={}", f.code, f.reason);
+                            // Gemini 1008 (Policy): audio + tool call conflict
+                            if f.code == tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy {
+                                return LoopExit::Disconnected1008;
+                            }
+                        } else {
+                            log::info!("[Session] WebSocket closed (no close frame)");
+                        }
+                        return LoopExit::Disconnected;
+                    }
+                    None => {
+                        log::info!("[Session] WebSocket stream ended");
+                        return LoopExit::Disconnected;
+                    }
+                    Some(Err(e)) => {
+                        log::error!("[Session] WebSocket error: {}", e);
+                        if let Err(e) = app.emit("agent-status", StatusPayload {
+                            state: "error".into(),
+                            message: Some(format!("{}", e)),
+                        }) { log::warn!("[Session] Emit event error: {}", e); }
+                        return LoopExit::Disconnected;
+                    }
+                    _ => {}
+                }
+            }
+
+            // Tool execution results — send back to WS as function_call_output
+            task_event = task_rx.recv() => {
+                match task_event {
+                    Some(task_manager::TaskEvent::Completed(result)) => {
+                        log::info!("[Session] Tool {} completed: {} bytes", result.tool_name, result.output.len());
+
+                        // Persist tool result to memory
+                        let _ = memory.persist_tool_result(&result.tool_name, &result.output).await;
+
+                        // Send function_call_output back to WS
+                        let output_msg = protocol.function_call_output_msg(
+                            &result.call_id, &result.tool_name, &result.output,
+                        );
+                        if let Err(e) = ws_sink.send(Message::Text(output_msg.into())).await {
+                            log::error!("[Session] Failed to send function_call_output: {}", e);
+                            return LoopExit::Disconnected;
+                        }
+
+                        tools_in_flight = tools_in_flight.saturating_sub(1);
+
+                        // When all tools for this batch complete, trigger response generation
+                        if tools_in_flight == 0 {
+                            consecutive_tool_rounds += 1;
+                            if consecutive_tool_rounds >= MAX_TOOL_ROUNDS {
+                                log::warn!("[Session] Reached max tool rounds ({}), forcing final response", MAX_TOOL_ROUNDS);
+                            } else {
+                                log::info!("[Session] Tool round {}/{} complete, triggering next response", consecutive_tool_rounds, MAX_TOOL_ROUNDS);
+                            }
+                            if let Some(resp) = protocol.response_create_msg() {
+                                if let Err(e) = ws_sink.send(Message::Text(resp.into())).await {
+                                    log::error!("[Session] Failed to send response.create: {}", e);
+                                    return LoopExit::Disconnected;
+                                }
+                            }
+                        }
+                    }
+                    Some(task_manager::TaskEvent::Progress { call_id, message }) => {
+                        log::debug!("[Session] Task {} progress: {} bytes", call_id, message.len());
+                    }
+                    None => {}
+                }
+            }
+
+            // Inject speech commands (from ambient/scheduler)
+            inject_text = inject_rx.recv() => {
+                match inject_text {
+                    Some(text) => {
+                        log::info!("[Session] Injecting speech ({} chars)", text.len());
+                        let msg = protocol.inject_speech_msg(&text);
+                        if let Err(e) = ws_sink.send(Message::Text(msg.into())).await {
+                            log::error!("[Session] Failed to inject speech: {}", e);
+                            return LoopExit::Disconnected;
+                        }
+                    }
+                    None => {
+                        // inject channel dropped — keep running
+                    }
+                }
+            }
+
+            // Subagent events (background task notifications → inject into voice)
+            subagent_event = subagent_rx.recv() => {
+                match subagent_event {
+                    Some(subagents::SubagentEvent::AskUser { task_id, question }) => {
+                        log::info!("[Session] Subagent {} asking user: {}", task_id, question);
+                        let prompt = format!(
+                            "[Background task {} needs your input] {}",
+                            task_id, question
+                        );
+                        let msg = protocol.inject_speech_msg(&prompt);
+                        if let Err(e) = ws_sink.send(Message::Text(msg.into())).await {
+                            log::error!("[Session] Failed to inject subagent question: {}", e);
+                            return LoopExit::Disconnected;
+                        }
+                    }
+                    Some(subagents::SubagentEvent::Completed { task_id, summary }) => {
+                        log::info!("[Session] Subagent {} completed: {}", task_id, summary);
+                        let prompt = format!(
+                            "[Background task {} completed] {}",
+                            task_id, summary
+                        );
+                        let msg = protocol.inject_speech_msg(&prompt);
+                        if let Err(e) = ws_sink.send(Message::Text(msg.into())).await {
+                            log::error!("[Session] Failed to inject subagent completion: {}", e);
+                            return LoopExit::Disconnected;
+                        }
+                    }
+                    Some(subagents::SubagentEvent::Failed { task_id, error }) => {
+                        log::info!("[Session] Subagent {} failed: {}", task_id, error);
+                        let prompt = format!(
+                            "[Background task {} failed] {}",
+                            task_id, error
+                        );
+                        let msg = protocol.inject_speech_msg(&prompt);
+                        if let Err(e) = ws_sink.send(Message::Text(msg.into())).await {
+                            log::error!("[Session] Failed to inject subagent failure: {}", e);
+                            return LoopExit::Disconnected;
+                        }
+                    }
+                    None => {}
+                }
+            }
+
+            // Control commands
+            cmd = cmd_rx.recv() => {
+                match cmd {
+                    Some(SessionCommand::Stop) | None => {
+                        task_mgr.abort_all();
+                        subagent_mgr.abort_all();
+                        return LoopExit::Stopped;
+                    }
+                    Some(SessionCommand::Reconnect(new_voice)) => {
+                        task_mgr.abort_all();
+                        return LoopExit::Reconnect(new_voice);
+                    }
+                    Some(SessionCommand::Disconnect) => {
+                        log::info!("[Session] Disconnect requested, waiting for AI farewell...");
+                        // Wait up to 3s for AI to finish speaking, then disconnect
+                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                        return LoopExit::WakeTimeout(user_turn_count); // Return to sleeping
+                    }
+                    Some(SessionCommand::Wake) => {} // Already connected, ignore
+                }
+            }
+        }
+    }
+}
+
+/// Handle a single WS message — audio playback + transcript forwarding + tool call dispatch
+/// Returns (replies, optional_exit): replies need to be sent back via WS, optional_exit carries reconnect signal when change_voice is triggered
+async fn handle_ws_message(
+    app: &AppHandle,
+    protocol: &dyn realtime_ws::RealtimeProtocol,
+    memory: &MemoryStore,
+    playback_tx: &mpsc::Sender<PlaybackCommand>,
+    raw: &str,
+    transcript_buf: &mut String,
+    pending_tool_calls: &mut Vec<task_manager::TaskRequest>,
+    task_mgr: &task_manager::TaskManager,
+    tools_in_flight: &mut usize,
+    consecutive_tool_rounds: &mut usize,
+    flags: &Arc<audio::SharedAudioFlags>,
+    subagent_mgr: &subagents::SubagentManager,
+    user_turn_count: &mut usize,
+    wakeword_nudge_checked: &mut bool,
+) -> (Vec<String>, Option<LoopExit>) {
+    let events = protocol.parse_events(raw);
+    let mut replies: Vec<String> = Vec::new();
+
+    if events.is_empty() {
+        return (replies, None);
+    }
+
+    for event in events {
+        match event {
+            realtime_ws::WsEvent::AudioDelta(base64) => {
+                if let Err(e) = playback_tx.try_send(PlaybackCommand::Enqueue(base64)) {
+                    log::warn!("[Session] Failed to send audio to playback: {}", e);
+                }
+            }
+            realtime_ws::WsEvent::AudioDone => {}
+            realtime_ws::WsEvent::ResponseStart => {
+                // Mark AI as speaking — suppresses mic immediately via is_ai_speaking flag
+                flags.is_ai_speaking.store(true, Ordering::Relaxed);
+                // Clear server-side audio buffer to discard any echo that leaked before local gating
+                if let Some(clear_msg) = protocol.input_audio_clear_msg() {
+                    replies.push(clear_msg);
+                }
+                // New reply starting: fade out previous audio (200ms) instead of hard cut
+                let _ = playback_tx.try_send(PlaybackCommand::FadeOut(200));
+            }
+            realtime_ws::WsEvent::Transcript(text) => {
+                log::info!("[Session] 🤖 Assistant: {}", text);
+                transcript_buf.push_str(&text);
+                if let Err(e) = app.emit(
+                    "agent-transcript",
+                    TranscriptPayload {
+                        role: "assistant".into(),
+                        text: text.clone(),
+                    },
+                ) {
+                    log::warn!("[Session] Emit event error: {}", e);
+                }
+            }
+            realtime_ws::WsEvent::TranscriptDone(text) => {
+                transcript_buf.clear();
+                let _ = memory.persist("assistant", &text).await;
+
+                // Show a one-time wakeword setup reminder after the first successful
+                // user<->assistant exchange when setup was previously skipped.
+                if *user_turn_count > 0
+                    && !text.trim().is_empty()
+                    && !*wakeword_nudge_checked
+                {
+                    *wakeword_nudge_checked = true;
+                    let pool = &app.state::<DbState>().0;
+                    let wake_enabled: Option<String> = sqlx::query_scalar(
+                        "SELECT value FROM app_settings WHERE key = 'wake_word_enabled'",
+                    )
+                    .fetch_optional(pool)
+                    .await
+                    .ok()
+                    .flatten();
+                    let setup_skipped: Option<String> = sqlx::query_scalar(
+                        "SELECT value FROM app_settings WHERE key = 'wakeword_setup_skipped'",
+                    )
+                    .fetch_optional(pool)
+                    .await
+                    .ok()
+                    .flatten();
+                    let nudge_shown: Option<String> = sqlx::query_scalar(
+                        "SELECT value FROM app_settings WHERE key = 'wakeword_nudge_shown'",
+                    )
+                    .fetch_optional(pool)
+                    .await
+                    .ok()
+                    .flatten();
+
+                    let wakeword_enabled = wake_enabled
+                        .as_deref()
+                        .map(|v| v == "true" || v == "1")
+                        .unwrap_or(false);
+                    let skipped = setup_skipped
+                        .as_deref()
+                        .map(|v| v == "true" || v == "1")
+                        .unwrap_or(false);
+                    let shown = nudge_shown
+                        .as_deref()
+                        .map(|v| v == "true" || v == "1")
+                        .unwrap_or(false);
+
+                    if !wakeword_enabled && skipped && !shown {
+                        if let Err(e) = app.emit(
+                            "agent-status",
+                            StatusPayload {
+                                state: "wakeword-nudge".into(),
+                                message: Some(crate::i18n::t("status.wakeword_nudge")),
+                            },
+                        ) {
+                            log::warn!("[Session] Emit wakeword nudge error: {}", e);
+                        }
+                        if let Err(e) = sqlx::query(
+                            "INSERT INTO app_settings (key, value) VALUES ('wakeword_nudge_shown', 'true') \
+                             ON CONFLICT(key) DO UPDATE SET value='true'",
+                        )
+                        .execute(pool)
+                        .await
+                        {
+                            log::warn!("[Session] Failed to persist wakeword_nudge_shown: {}", e);
+                        }
+                    }
+                }
+            }
+            realtime_ws::WsEvent::InputTranscript(text) => {
+                log::info!("[Session] 🎤 User: {}", text);
+                // New user speech resets the tool round counter
+                *consecutive_tool_rounds = 0;
+                *user_turn_count += 1;
+                if let Err(e) = app.emit(
+                    "agent-transcript",
+                    TranscriptPayload {
+                        role: "user".into(),
+                        text: text.clone(),
+                    },
+                ) {
+                    log::warn!("[Session] Emit event error: {}", e);
+                }
+                // Only forward transcript for persistence — do NOT trigger interrupt here.
+                // Interrupts are handled by the Realtime API's server VAD natively.
+                let _ = memory.persist("user", &text).await;
+            }
+            realtime_ws::WsEvent::FunctionCall {
+                call_id,
+                name,
+                arguments,
+            } => {
+                if name == "change_voice" {
+                    let args: Value =
+                        serde_json::from_str(&arguments).unwrap_or(serde_json::json!({}));
+                    let voice_name = args["voice_name"].as_str().unwrap_or("").to_string();
+                    log::info!("[Session] Change voice requested: {}", voice_name);
+
+                    // Validate voice name against known providers
+                    let valid = protocol.is_valid_voice(&voice_name);
+                    if !valid {
+                        log::warn!("[Session] Rejected invalid voice name: {}", voice_name);
+                        replies.push(protocol.function_call_output_msg(
+                        &call_id, &name,
+                        &format!("{{\"error\":\"Unknown voice '{}'. Use one of the supported voice names.\"}}", voice_name),
+                    ));
+                        return (replies, None);
+                    }
+
+                    // Write to DB
+                    let pool = &app.state::<DbState>().0;
+                    if let Ok(mut tx) = pool.begin().await {
+                        let res1 = sqlx::query("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('voice_name', ?1)")
+                            .bind(&voice_name)
+                            .execute(&mut *tx)
+                            .await;
+                        let res2 = sqlx::query("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('voice_onboarded', 'true')")
+                            .execute(&mut *tx)
+                            .await;
+                        if res1.is_ok() && res2.is_ok() {
+                            let _ = tx.commit().await;
+                        } else {
+                            log::error!("[Session] Failed to persist voice settings");
+                            let _ = tx.rollback().await;
+                        }
+                    } else {
+                        log::error!("[Session] Failed to start transaction for voice settings");
+                    }
+
+                    // Complete FC
+                    replies.push(protocol.function_call_output_msg(
+                        &call_id,
+                        &name,
+                        "{\"status\":\"switching\"}",
+                    ));
+
+                    return (replies, Some(LoopExit::Reconnect(voice_name)));
+                }
+
+                // Subagent tools — handled immediately (bypass task_manager)
+                if name == "spawn_subagent" {
+                    let args: Value =
+                        serde_json::from_str(&arguments).unwrap_or(serde_json::json!({}));
+                    let goal = args["goal"].as_str().unwrap_or("").to_string();
+                    let result = match subagent_mgr.spawn(&goal).await {
+                        Ok(task_id) => {
+                            log::info!("[Session] Spawned subagent {} for: {}", task_id, goal);
+                            serde_json::json!({"task_id": task_id, "status": "spawned"}).to_string()
+                        }
+                        Err(e) => {
+                            log::error!("[Session] Failed to spawn subagent: {}", e);
+                            serde_json::json!({"error": e}).to_string()
+                        }
+                    };
+                    replies.push(protocol.function_call_output_msg(&call_id, &name, &result));
+                } else if name == "reply_to_subagent" {
+                    let args: Value =
+                        serde_json::from_str(&arguments).unwrap_or(serde_json::json!({}));
+                    let task_id = args["task_id"].as_str().unwrap_or("").to_string();
+                    let message = args["message"].as_str().unwrap_or("").to_string();
+                    let result = match subagent_mgr.reply(&task_id, &message) {
+                        Ok(()) => {
+                            log::info!("[Session] Delivered reply to subagent {}", task_id);
+                            serde_json::json!({"status": "delivered", "task_id": task_id})
+                                .to_string()
+                        }
+                        Err(e) => serde_json::json!({"error": e}).to_string(),
+                    };
+                    replies.push(protocol.function_call_output_msg(&call_id, &name, &result));
+                } else if *consecutive_tool_rounds >= MAX_TOOL_ROUNDS {
+                    // Safety: reject tool calls if we've exceeded max consecutive rounds
+                    log::warn!(
+                        "[Session] Rejecting tool call {} — max rounds ({}) reached",
+                        name,
+                        MAX_TOOL_ROUNDS
+                    );
+                    replies.push(protocol.function_call_output_msg(
+                    &call_id, &name, "{\"error\": \"Maximum tool execution rounds reached. Please summarize your progress and tell the user.\"}"
+                ));
+                } else {
+                    // All other tools: accumulate for batch submission
+                    log::info!(
+                        "[Session] Tool call: {}({})",
+                        name,
+                        &arguments.chars().take(100).collect::<String>()
+                    );
+                    pending_tool_calls.push(task_manager::TaskRequest {
+                        call_id,
+                        tool_name: name,
+                        arguments,
+                    });
+                }
+            }
+            realtime_ws::WsEvent::ResponseDone => {
+                log::info!("[Session] Response completed");
+                // Clear AI speaking flag — playback buffer + echo tail handle the remaining audio
+                flags.is_ai_speaking.store(false, Ordering::Relaxed);
+                // Persist accumulated transcript to memory
+                if !transcript_buf.is_empty() {
+                    let full_text = std::mem::take(transcript_buf);
+                    let _ = memory.persist("assistant", &full_text).await;
+                }
+                // Submit any pending tool calls as a batch
+                if !pending_tool_calls.is_empty() {
+                    let calls: Vec<task_manager::TaskRequest> = std::mem::take(pending_tool_calls);
+                    *tools_in_flight += calls.len();
+                    log::info!("[Session] Submitting {} tool calls", *tools_in_flight);
+                    task_mgr.submit(calls);
+                }
+            }
+            realtime_ws::WsEvent::Error(msg) => {
+                log::error!("[Session] Server error: {}", msg);
+                if let Err(e) = app.emit(
+                    "agent-status",
+                    StatusPayload {
+                        state: "error".into(),
+                        message: Some(msg),
+                    },
+                ) {
+                    log::warn!("[Session] Emit event error: {}", e);
+                }
+            }
+            realtime_ws::WsEvent::Other(event_type) => {
+                // speech_started from server VAD — user is interrupting the AI
+                if event_type == "input_audio_buffer.speech_started" {
+                    // Clear AI speaking flag so mic can open for user
+                    flags.is_ai_speaking.store(false, Ordering::Relaxed);
+                    // Fade out and clear playback buffer so old audio stops quickly
+                    // and is_playing becomes false, allowing mic to fully open
+                    let _ = playback_tx.try_send(PlaybackCommand::FadeOut(100));
+                    if *tools_in_flight > 0 {
+                        log::info!(
+                            "[Session] User speech detected, aborting {} running tools",
+                            tools_in_flight
+                        );
+                        task_mgr.abort_all();
+                        *tools_in_flight = 0;
+                    }
+                } else {
+                    let preview: String = raw.chars().take(300).collect();
+                    log::debug!("[Session] WS event '{}': {}", event_type, preview);
+                }
+            }
+        }
+    }
+    (replies, None)
+}

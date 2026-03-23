@@ -1,0 +1,39 @@
+{
+  "status.no_provider": "No voice AI service configured",
+  "status.no_api_key": "API Key not set",
+  "status.connection_failed": "Connection failed",
+  "status.switching_voice": "Switching voice to",
+  "status.disconnected": "Disconnected, reconnecting…",
+  "status.reconnecting": "Disconnected, reconnecting…",
+  "status.no_mic": "No microphone detected. Will auto-connect when plugged in",
+  "status.mic_connected": "Microphone connected",
+  "status.wakeword_nudge": "You skipped wake word setup before. You can enable it in Settings > General for hands-free wake.",
+
+  "audio.no_mic": "No microphone device found",
+  "audio.no_module": "Audio module not started",
+  "audio.enum_config_failed": "Failed to enumerate audio configs",
+  "audio.no_config": "No available audio input config",
+  "audio.build_stream_failed": "Failed to build audio stream",
+  "audio.unsupported_format": "Unsupported audio format",
+  "audio.start_stream_failed": "Failed to start audio stream",
+
+  "wakeword.appdata_failed": "Failed to get app_data_dir",
+  "wakeword.mkdir_failed": "Failed to create wakewords directory",
+  "wakeword.wav_writer_failed": "WAV writer creation failed",
+  "wakeword.wav_write_failed": "WAV write failed",
+  "wakeword.wav_finalize_failed": "WAV finalize failed",
+  "wakeword.no_recording": "No recording data",
+  "wakeword.save_sample_failed": "Failed to save sample",
+  "wakeword.read_sample_failed": "Failed to read sample",
+  "wakeword.min_samples": "At least 3 recording samples required, currently only",
+  "wakeword.train_failed": "Model training failed",
+  "wakeword.save_model_failed": "Failed to save model",
+  "wakeword.read_dir_failed": "Failed to read wakewords directory",
+  "wakeword.delete_failed": "Failed to delete model",
+
+  "prompt.suggest_name": "You don't have a name yet. Early in the conversation, naturally suggest the user give you a name — for example: \"By the way, I don't have a name yet. Want to give me one?\" Only mention this once.\n",
+
+  "tray.settings": "Settings",
+  "tray.check_update": "Check for Updates",
+  "tray.quit": "Quit"
+}

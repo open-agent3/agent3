@@ -1,0 +1,39 @@
+{
+  "status.no_provider": "未配置语音 AI 服务",
+  "status.no_api_key": "API Key 未设置",
+  "status.connection_failed": "连接失败",
+  "status.switching_voice": "正在切换音色",
+  "status.disconnected": "连接断开，正在重连…",
+  "status.reconnecting": "连接断开，正在重连…",
+  "status.no_mic": "未检测到麦克风，请接入后自动连接",
+  "status.mic_connected": "麦克风已连接",
+  "status.wakeword_nudge": "你之前跳过了唤醒词设置。现在可在设置-通用中开启，之后可直接语音唤醒助手。",
+
+  "audio.no_mic": "未找到麦克风设备",
+  "audio.no_module": "音频模块未启动",
+  "audio.enum_config_failed": "枚举音频配置失败",
+  "audio.no_config": "无可用音频输入配置",
+  "audio.build_stream_failed": "构建音频流失败",
+  "audio.unsupported_format": "不支持的音频格式",
+  "audio.start_stream_failed": "启动音频流失败",
+
+  "wakeword.appdata_failed": "获取 app_data_dir 失败",
+  "wakeword.mkdir_failed": "创建 wakewords 目录失败",
+  "wakeword.wav_writer_failed": "WAV writer 创建失败",
+  "wakeword.wav_write_failed": "WAV 写入失败",
+  "wakeword.wav_finalize_failed": "WAV finalize 失败",
+  "wakeword.no_recording": "没有录制数据",
+  "wakeword.save_sample_failed": "保存样本失败",
+  "wakeword.read_sample_failed": "读取样本失败",
+  "wakeword.min_samples": "至少需要 3 个录音样本，当前只有",
+  "wakeword.train_failed": "模型训练失败",
+  "wakeword.save_model_failed": "保存模型失败",
+  "wakeword.read_dir_failed": "读取 wakewords 目录失败",
+  "wakeword.delete_failed": "删除模型失败",
+
+  "prompt.suggest_name": "你还没有名字。在对话初期，自然地建议用户给你起一个名字——比如：\"对了，我还没有名字呢，你想给我起一个吗？\" 只提一次就好。\n",
+
+  "tray.settings": "设置",
+  "tray.check_update": "检查更新",
+  "tray.quit": "退出"
+}
