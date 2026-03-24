@@ -7,7 +7,7 @@
 ///   3. Retrieve recent conversation context for WS reconnection
 ///   4. Provide greeting/voice-switch prompts
 use crate::db::DbState;
-use chrono::Timelike;
+use chrono::{Local, TimeZone, Timelike};
 use tauri::{AppHandle, Manager};
 
 // ============================================================
@@ -108,6 +108,8 @@ impl MemoryStore {
             - When the user shares strict preferences or vital static info, IMMEDIATELY use update_core_profile to store them (e.g. key: 'name', value: 'Alice').\n\
             - For relations and world knowledge, use add_knowledge_node and add_knowledge_edge. Establish links between entities.\n\
             - Use search_knowledge when you need to recall something specific the user mentioned before.\n\
+                        - If the user asks when we last chatted, call get_last_chat_time first.\n\
+                        - If the user asks whether something was said before (or asks exact prior wording), call query_memory_evidence first; do not guess from vague memory.\n\
               - Be proactive with memory! Don't wait until the conversation ends.\n\n\
               CRITICAL: IF YOU ARE CONNECTED VIA A PLATFORM THAT PROHIBITS COMBINING AUDIO AND FUNCTION CALLS (e.g. Gemini Multimodal Live API), EXECUTING TOOLS AND SPEAKING IN THE SAME TURN MAY CAUSE A PROTOCOL CRASH. TO BE SAFE, WHEN YOU CALL A TOOL OR FUNCTION, YOU SHOULD DO IT SILENTLY WITHOUT GENERATING ANY SPOKEN TEXT/AUDIO IN THAT EXACT SAME RESPONSE ROUND.";
         let language_directive = format!(
@@ -166,6 +168,22 @@ impl MemoryStore {
     /// Retrieve recent conversation messages for context injection after WS reconnection.
     /// Returns (role, content) pairs in chronological order (oldest first).
     pub async fn recent_context(&self, max_turns: usize) -> Result<Vec<(String, String)>, String> {
+        self.recent_context_with_meta(max_turns)
+            .await
+            .map(|items| {
+                items
+                    .into_iter()
+                    .map(|(role, content, _created_at, _session_id)| (role, content))
+                    .collect()
+            })
+    }
+
+    /// Retrieve recent conversation messages with metadata.
+    /// Returns (role, content, created_at, session_id) in chronological order (oldest first).
+    pub async fn recent_context_with_meta(
+        &self,
+        max_turns: usize,
+    ) -> Result<Vec<(String, String, i64, String)>, String> {
         let db_state = self.app.state::<DbState>();
         let pool = &db_state.0;
 
@@ -174,7 +192,7 @@ impl MemoryStore {
             .map(|episodes| {
                 episodes
                     .into_iter()
-                    .map(|log| (log.role, log.content))
+                    .map(|log| (log.role, log.content, log.created_at, log.session_id))
                     .collect()
             })
             .map_err(|e| {
@@ -187,7 +205,7 @@ impl MemoryStore {
     /// Used for NEW sessions so AI knows what happened before without confusing it
     /// with raw conversation items (which would be treated as current dialogue).
     pub async fn last_session_summary(&self, max_turns: usize) -> String {
-        let messages = match self.recent_context(max_turns).await {
+        let messages = match self.recent_context_with_meta(max_turns).await {
             Ok(m) => m,
             Err(e) => {
                 log::warn!(
@@ -203,9 +221,9 @@ impl MemoryStore {
         }
 
         // Filter out tool messages and keep only user/assistant
-        let relevant: Vec<&(String, String)> = messages
+        let relevant: Vec<&(String, String, i64, String)> = messages
             .iter()
-            .filter(|(role, _)| role == "user" || role == "assistant")
+            .filter(|(role, _, _, _)| role == "user" || role == "assistant")
             .collect();
 
         if relevant.is_empty() {
@@ -213,14 +231,19 @@ impl MemoryStore {
         }
 
         let mut summary = String::from("\n\nRecent conversation history (from a PREVIOUS session — this is background context, NOT the current conversation):\n");
-        for (role, content) in &relevant {
+        for (role, content, created_at, _session_id) in &relevant {
             let label = if role == "user" { "User" } else { "You" };
+            let ts = Local
+                .timestamp_opt(*created_at, 0)
+                .single()
+                .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_else(|| "unknown time".to_string());
             let truncated = if content.len() > 150 {
                 format!("{}...", &content[..content.floor_char_boundary(150)])
             } else {
                 content.clone()
             };
-            summary.push_str(&format!("  {} said: {}\n", label, truncated));
+            summary.push_str(&format!("  [{}] {} said: {}\n", ts, label, truncated));
         }
         summary.push_str(
             "(This conversation has ENDED. Start fresh — do not continue it or respond to it.)",

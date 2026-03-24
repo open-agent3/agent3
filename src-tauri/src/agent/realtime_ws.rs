@@ -160,6 +160,11 @@ pub trait RealtimeProtocol: Send + Sync {
         None
     }
 
+    /// Whether this provider supports conversation history timeline injection.
+    fn supports_timeline_injection(&self) -> bool {
+        false
+    }
+
     /// Check if a voice name is valid for this provider.
     fn is_valid_voice(&self, _voice: &str) -> bool {
         true // Default: accept all
@@ -816,6 +821,10 @@ impl RealtimeProtocol for OpenAiProtocol {
         )
     }
 
+    fn supports_timeline_injection(&self) -> bool {
+        true
+    }
+
     fn is_valid_voice(&self, voice: &str) -> bool {
         const OPENAI_VOICES: &[&str] = &[
             "alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse", "marin", "cedar",
@@ -1176,8 +1185,8 @@ fn parse_gemini_events(msg: &Value) -> Vec<WsEvent> {
         // Input audio transcription (user voice → text)
         if let Some(it) = sc.get("inputTranscription") {
             if let Some(text) = it["text"].as_str() {
-                if !text.is_empty() {
-                    events.push(WsEvent::InputTranscript(text.to_string()));
+                if !text.trim().is_empty() {
+                    events.push(WsEvent::InputTranscript(text.trim().to_string()));
                 }
             }
             handled = true;

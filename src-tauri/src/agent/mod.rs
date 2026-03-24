@@ -6,6 +6,7 @@
 pub mod ambient;
 pub mod audio;
 pub mod memory;
+pub mod memory_injection;
 pub mod playback;
 pub mod realtime_ws;
 pub mod scheduler;

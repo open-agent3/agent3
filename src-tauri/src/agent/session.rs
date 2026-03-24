@@ -7,6 +7,7 @@
 /// 4. Persisting transcripts/tool results via MemoryStore
 use crate::agent::audio::{self, WakeEvent, WakeState};
 use crate::agent::memory::MemoryStore;
+use crate::agent::memory_injection::{self, DefaultMemoryInjectionPolicy, InjectionScenario};
 use crate::agent::playback::PlaybackCommand;
 use crate::agent::{realtime_ws, subagents, task_manager, tools};
 use crate::db::DbState;
@@ -20,6 +21,9 @@ use tokio_tungstenite::tungstenite::Message;
 
 /// Maximum consecutive tool-triggered response rounds before forcing the model to stop calling tools
 const MAX_TOOL_ROUNDS: usize = 10;
+const DEFAULT_MEMORY_TOOL_EXCLUDE_RECENT_SECONDS: i64 = 2;
+const MAX_MEMORY_TOOL_LOOKBACK_SECONDS: i64 = 30 * 24 * 60 * 60;
+const MAX_1008_RETRIES: usize = 3;
 
 // ============================================================
 // Event payloads (emitted to frontend)
@@ -260,6 +264,7 @@ async fn session_loop(
     playback_tx: mpsc::Sender<PlaybackCommand>,
 ) {
     let memory = MemoryStore::new(app.clone());
+    let injection_policy = DefaultMemoryInjectionPolicy;
     let (subagent_event_tx, mut subagent_event_rx) = mpsc::channel::<subagents::SubagentEvent>(64);
     let subagent_mgr = subagents::SubagentManager::new(app.clone(), subagent_event_tx);
     let mut first_boot = true;
@@ -267,6 +272,7 @@ async fn session_loop(
         // ── Phase 1: Wait for wake signal ──
         let mut connect_mode = ConnectMode::NewSession;
         let mut scheduled_task_desc: Option<String> = None;
+        let mut crash_1008_retries: usize = 0;
         flags.session_state.store(0, Ordering::Relaxed); // 0 = sleeping
 
         // On first boot, skip waiting for wakeword — connect immediately
@@ -441,69 +447,19 @@ async fn session_loop(
                 log::warn!("[Session] Emit event error: {}", e);
             }
 
-            // Context injection + greeting strategy depends on connect mode:
-            // - VoiceSwitch: greeting FIRST (so AI responds with a proper greeting
-            //   against a clean conversation), THEN inject raw history for follow-up.
-            // - SilentReconnect: inject raw history only, no greeting.
-            // - NewSession: greeting only (history is in system instructions as summary).
-            match connect_mode {
+            // Build provider-agnostic memory context pack based on scenario,
+            // then let protocol encode it into provider-specific wire messages.
+            let scenario = match connect_mode {
                 ConnectMode::VoiceSwitch => {
-                    // Greeting only — system instructions already contain last_session_summary
-                    // so the AI has enough context without raw message injection (which would
-                    // corrupt the conversation state by appending old messages after the greeting).
                     let greeting = memory.contextual_greeting("voice_switch", None);
-                    log::info!("[Session] Voice switch: injecting greeting");
-                    let greeting_msg = protocol.inject_speech_msg(&greeting);
-                    if let Err(e) = ws_sink.send(Message::Text(greeting_msg.into())).await {
-                        log::error!("[Session] Failed to inject greeting: {}", e);
-                        continue 'conn;
-                    }
+                    InjectionScenario::VoiceSwitch { greeting }
                 }
-                ConnectMode::SilentReconnect => {
-                    // Inject raw history only — seamless continuation after WS error
-                    let context = memory.recent_context(20).await.unwrap_or_default();
-                    if !context.is_empty() {
-                        log::info!(
-                            "[Session] Silent reconnect: injecting {} messages",
-                            context.len()
-                        );
-                        for (role, text) in &context {
-                            if let Some(msg) = protocol.conversation_inject_msg(role, text) {
-                                if let Err(e) = ws_sink.send(Message::Text(msg.into())).await {
-                                    log::error!("[Session] Failed to inject context: {}", e);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-                ConnectMode::ToolRetry => {
-                    // Gemini 1008 recovery: inject history + explicit tool-only retry hint
-                    let context = memory.recent_context(20).await.unwrap_or_default();
-                    if !context.is_empty() {
-                        log::info!(
-                            "[Session] Tool retry (1008 recovery): injecting {} messages + retry hint",
-                            context.len()
-                        );
-                        for (role, text) in &context {
-                            if let Some(msg) = protocol.conversation_inject_msg(role, text) {
-                                if let Err(e) = ws_sink.send(Message::Text(msg.into())).await {
-                                    log::error!("[Session] Failed to inject context: {}", e);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    // Inject a system hint telling the model to silently complete the pending tool call
-                    let retry_hint = "[System] Your previous response was interrupted because you tried to speak and call a tool at the same time. This time, ONLY execute the tool/function call silently — do NOT generate any spoken audio. After the tool result comes back, you may speak to the user.";
-                    let hint_msg = protocol.inject_speech_msg(retry_hint);
-                    if let Err(e) = ws_sink.send(Message::Text(hint_msg.into())).await {
-                        log::error!("[Session] Failed to inject tool retry hint: {}", e);
-                        continue 'conn;
-                    }
-                }
+                ConnectMode::SilentReconnect => InjectionScenario::SilentReconnect { max_turns: 20 },
+                ConnectMode::ToolRetry => InjectionScenario::ToolRetry {
+                    max_turns: 20,
+                    retry_hint: "[System] Your previous response was interrupted because you tried to speak and call a tool at the same time. This time, ONLY execute the tool/function call silently — do NOT generate any spoken audio. After the tool result comes back, you may speak to the user.".to_string(),
+                },
                 ConnectMode::NewSession => {
-                    // Greeting only — history is already in system instructions as summary
                     let greeting = if !is_voice_onboarded {
                         // Mark as onboarded in memory so we don't ask again if we reconnect in this session
                         is_voice_onboarded = true;
@@ -515,12 +471,31 @@ async fn session_loop(
                     } else {
                         memory.contextual_greeting("wakeword", None)
                     };
-                    log::info!("[Session] New session: injecting greeting");
-                    let greeting_msg = protocol.inject_speech_msg(&greeting);
-                    if let Err(e) = ws_sink.send(Message::Text(greeting_msg.into())).await {
-                        log::error!("[Session] Failed to inject greeting: {}", e);
-                        continue 'conn;
+                    InjectionScenario::NewSession { greeting }
+                }
+            };
+
+            let pack = injection_policy.build_pack(&memory, scenario).await;
+            let encoded = memory_injection::encode_pack(protocol.as_ref(), &pack);
+
+            if encoded.timeline_items > 0 {
+                log::info!(
+                    "[Session] Context injection: timeline items={}, dropped={}, provider_supports_timeline={}, continuity_fallback={}",
+                    encoded.timeline_items,
+                    encoded.dropped_timeline_items,
+                    protocol.supports_timeline_injection(),
+                    if encoded.dropped_timeline_items > 0 && !protocol.supports_timeline_injection() {
+                        "enabled"
+                    } else {
+                        "disabled"
                     }
+                );
+            }
+
+            for msg in encoded.messages {
+                if let Err(e) = ws_sink.send(Message::Text(msg.into())).await {
+                    log::error!("[Session] Failed to inject memory context: {}", e);
+                    continue 'conn;
                 }
             }
 
@@ -547,6 +522,10 @@ async fn session_loop(
                 &mut subagent_event_rx,
             )
             .await;
+
+            if !matches!(exit, LoopExit::Disconnected1008) {
+                crash_1008_retries = 0;
+            }
 
             // Close WS — clear speaking flag so mic reopens
             flags.is_ai_speaking.store(false, Ordering::Relaxed);
@@ -660,7 +639,33 @@ async fn session_loop(
                     }
                 }
                 LoopExit::Disconnected1008 => {
-                    log::warn!("[Session] Gemini 1008 crash (audio+tool conflict) — retrying with tool-only mode in 2s");
+                    crash_1008_retries = crash_1008_retries.saturating_add(1);
+                    if crash_1008_retries > MAX_1008_RETRIES {
+                        log::error!(
+                            "[Session] Gemini 1008 crash exceeded retry limit ({}), returning to sleep",
+                            MAX_1008_RETRIES
+                        );
+                        if let Err(e) = app.emit(
+                            "agent-status",
+                            StatusPayload {
+                                state: "error".into(),
+                                message: Some(crate::i18n::t("status.connection_failed")),
+                            },
+                        ) {
+                            log::warn!("[Session] Emit event error: {}", e);
+                        }
+                        break 'conn;
+                    }
+
+                    let backoff_secs = (1u64 << crash_1008_retries.min(4))
+                        .saturating_mul(2)
+                        .min(16);
+                    log::warn!(
+                        "[Session] Gemini 1008 crash (audio+tool conflict) — retrying with tool-only mode in {}s (attempt {}/{})",
+                        backoff_secs,
+                        crash_1008_retries,
+                        MAX_1008_RETRIES
+                    );
                     if let Err(e) = app.emit(
                         "agent-status",
                         StatusPayload {
@@ -672,7 +677,7 @@ async fn session_loop(
                     }
                     connect_mode = ConnectMode::ToolRetry;
                     tokio::select! {
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => continue 'conn,
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => continue 'conn,
                         cmd = cmd_rx.recv() => {
                             if matches!(cmd, Some(SessionCommand::Stop) | None) { break 'outer; }
                             continue 'conn;
@@ -729,6 +734,11 @@ async fn run_event_loop(
     let mut consecutive_tool_rounds: usize = 0;
     // Count user transcript turns for post-session consolidation guard
     let mut user_turn_count: usize = 0;
+    // Timestamp of the current user turn start (first transcript chunk),
+    // used as default cutoff for memory evidence queries.
+    let mut user_turn_started_at: Option<i64> = None;
+    // Some providers can emit duplicated completion markers for one logical turn.
+    let mut response_done_handled_for_turn = false;
     // Guard for per-connection wakeword nudge check to avoid repeated DB queries.
     let mut wakeword_nudge_checked: bool = false;
 
@@ -774,7 +784,9 @@ async fn run_event_loop(
                             flags,
                             subagent_mgr,
                             &mut user_turn_count,
+                            &mut user_turn_started_at,
                             &mut wakeword_nudge_checked,
+                            &mut response_done_handled_for_turn,
                         ).await;
                         for reply in replies {
                             if let Err(e) = ws_sink.send(Message::Text(reply.into())).await {
@@ -797,7 +809,9 @@ async fn run_event_loop(
                                 flags,
                                 subagent_mgr,
                                 &mut user_turn_count,
+                                &mut user_turn_started_at,
                                 &mut wakeword_nudge_checked,
+                                &mut response_done_handled_for_turn,
                             ).await;
                             for reply in replies {
                                 if let Err(e) = ws_sink.send(Message::Text(reply.into())).await {
@@ -806,7 +820,6 @@ async fn run_event_loop(
                                 }
                             }
                             if let Some(e) = exit {
-                                flush_user_transcript(memory, &mut user_transcript_buf, &mut user_turn_count).await;
                                 flush_user_transcript(memory, &mut user_transcript_buf, &mut user_turn_count).await;
                                 return e;
                             }
@@ -993,7 +1006,9 @@ async fn handle_ws_message(
     flags: &Arc<audio::SharedAudioFlags>,
     subagent_mgr: &subagents::SubagentManager,
     user_turn_count: &mut usize,
+    user_turn_started_at: &mut Option<i64>,
     wakeword_nudge_checked: &mut bool,
+    response_done_handled_for_turn: &mut bool,
 ) -> (Vec<String>, Option<LoopExit>) {
     let events = protocol.parse_events(raw);
     let mut replies: Vec<String> = Vec::new();
@@ -1011,6 +1026,7 @@ async fn handle_ws_message(
             }
             realtime_ws::WsEvent::AudioDone => {}
             realtime_ws::WsEvent::ResponseStart => {
+                *response_done_handled_for_turn = false;
                 // User turn ended. Persist one consolidated user message before assistant reply starts.
                 flush_user_transcript(memory, user_transcript_buf, user_turn_count).await;
                 // Mark AI as speaking — suppresses mic immediately via is_ai_speaking flag
@@ -1105,9 +1121,17 @@ async fn handle_ws_message(
                 }
             }
             realtime_ws::WsEvent::InputTranscript(text) => {
+                if text.trim().is_empty() {
+                    log::debug!("[Session] Ignored blank user transcript chunk");
+                    continue;
+                }
+                *response_done_handled_for_turn = false;
                 log::info!("[Session] 🎤 User: {}", text);
                 // New user speech resets the tool round counter
                 *consecutive_tool_rounds = 0;
+                if user_transcript_buf.is_empty() && !text.trim().is_empty() {
+                    *user_turn_started_at = Some(chrono::Utc::now().timestamp());
+                }
                 if let Err(e) = app.emit(
                     "agent-transcript",
                     TranscriptPayload {
@@ -1125,9 +1149,10 @@ async fn handle_ws_message(
                 name,
                 arguments,
             } => {
+                let mut effective_arguments = arguments;
                 if name == "change_voice" {
                     let args: Value =
-                        serde_json::from_str(&arguments).unwrap_or(serde_json::json!({}));
+                        serde_json::from_str(&effective_arguments).unwrap_or(serde_json::json!({}));
                     let voice_name = args["voice_name"].as_str().unwrap_or("").to_string();
                     log::info!("[Session] Change voice requested: {}", voice_name);
 
@@ -1175,7 +1200,7 @@ async fn handle_ws_message(
                 // Subagent tools — handled immediately (bypass task_manager)
                 if name == "spawn_subagent" {
                     let args: Value =
-                        serde_json::from_str(&arguments).unwrap_or(serde_json::json!({}));
+                        serde_json::from_str(&effective_arguments).unwrap_or(serde_json::json!({}));
                     let goal = args["goal"].as_str().unwrap_or("").to_string();
                     let result = match subagent_mgr.spawn(&goal).await {
                         Ok(task_id) => {
@@ -1190,7 +1215,7 @@ async fn handle_ws_message(
                     replies.push(protocol.function_call_output_msg(&call_id, &name, &result));
                 } else if name == "reply_to_subagent" {
                     let args: Value =
-                        serde_json::from_str(&arguments).unwrap_or(serde_json::json!({}));
+                        serde_json::from_str(&effective_arguments).unwrap_or(serde_json::json!({}));
                     let task_id = args["task_id"].as_str().unwrap_or("").to_string();
                     let message = args["message"].as_str().unwrap_or("").to_string();
                     let result = match subagent_mgr.reply(&task_id, &message) {
@@ -1213,20 +1238,49 @@ async fn handle_ws_message(
                     &call_id, &name, "{\"error\": \"Maximum tool execution rounds reached. Please summarize your progress and tell the user.\"}"
                 ));
                 } else {
+                    // Root fix: time/evidence checks should default to "before now"
+                    // to avoid using current-turn utterances as evidence.
+                    if name == "query_memory_evidence" || name == "get_last_chat_time" {
+                        if let Ok(mut args) = serde_json::from_str::<Value>(&effective_arguments) {
+                            let now_ts = chrono::Utc::now().timestamp();
+                            let cutoff = user_turn_started_at.unwrap_or(now_ts);
+                            let min_allowed = now_ts - MAX_MEMORY_TOOL_LOOKBACK_SECONDS;
+
+                            let sanitized_before = args
+                                .get("before_unix_ts")
+                                .and_then(|v| v.as_i64())
+                                .filter(|ts| *ts >= min_allowed && *ts <= now_ts + 60)
+                                .unwrap_or(cutoff);
+                            args["before_unix_ts"] = serde_json::json!(sanitized_before);
+
+                            if args.get("exclude_recent_seconds").is_none() {
+                                args["exclude_recent_seconds"] =
+                                    serde_json::json!(DEFAULT_MEMORY_TOOL_EXCLUDE_RECENT_SECONDS);
+                            }
+                            effective_arguments = args.to_string();
+                        }
+                    }
+
                     // All other tools: accumulate for batch submission
                     log::info!(
-                        "[Session] Tool call: {}({})",
+                        "[Session] Tool call: {} (args_bytes={})",
                         name,
-                        &arguments.chars().take(100).collect::<String>()
+                        effective_arguments.len()
                     );
+                    log::debug!("[Session] Tool args {}: {}", name, effective_arguments);
                     pending_tool_calls.push(task_manager::TaskRequest {
                         call_id,
                         tool_name: name,
-                        arguments,
+                        arguments: effective_arguments,
                     });
                 }
             }
             realtime_ws::WsEvent::ResponseDone => {
+                if *response_done_handled_for_turn {
+                    log::debug!("[Session] Ignoring duplicated ResponseDone in same turn");
+                    continue;
+                }
+                *response_done_handled_for_turn = true;
                 log::info!("[Session] Response completed");
                 // Fallback flush for providers/events that may not emit ResponseStart.
                 flush_user_transcript(memory, user_transcript_buf, user_turn_count).await;
@@ -1328,7 +1382,8 @@ async fn flush_user_transcript(
     user_transcript_buf: &mut String,
     user_turn_count: &mut usize,
 ) {
-    if user_transcript_buf.is_empty() {
+    if user_transcript_buf.trim().is_empty() {
+        user_transcript_buf.clear();
         return;
     }
 
