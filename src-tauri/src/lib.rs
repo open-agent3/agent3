@@ -254,14 +254,17 @@ pub fn run() {
 
             let window = app.get_webview_window("main").unwrap();
 
-            // Position main window to cover the whole screen, but click-through
+            // Position main window to cover the whole screen, but click-through.
             if let Ok(Some(monitor)) = window.current_monitor() {
                 let screen = monitor.size();
                 let scale = monitor.scale_factor();
                 let width = screen.width as f64 / scale;
-                // Subtracting 1 pixel from height prevents Windows from treating it as
-                // a "fullscreen exclusive" app, which would otherwise hide the taskbar.
+
+                #[cfg(target_os = "windows")]
                 let height = (screen.height as f64 / scale) - 1.0;
+
+                #[cfg(not(target_os = "windows"))]
+                let height = screen.height as f64 / scale;
 
                 let _ = window.set_size(tauri::LogicalSize::new(width, height));
                 let _ = window.set_position(tauri::LogicalPosition::new(0.0, 0.0));
