@@ -129,6 +129,21 @@ export class AgentBridge {
           this.onConnectionStateChange?.("connected");
           this.showStatus(t("bridge.connected"), "info", 3000);
           break;
+        case "update-checking":
+          this.showStatus(message || "Checking for updates...", "info", 2500);
+          break;
+        case "update-available":
+          this.showStatus(message || "Update available. Downloading...", "info", 4000);
+          break;
+        case "update-installed":
+          this.showStatus(message || "Update installed. Restarting...", "info", 2500);
+          break;
+        case "update-none":
+          this.showStatus(message || "Already on the latest version", "info", 3000);
+          break;
+        case "update-error":
+          this.showStatus(message || "Failed to check for updates", "error", 6000);
+          break;
         case "disconnected":
           this.onConnectionStateChange?.("disconnected");
           this.showStatus(message || t("bridge.reconnecting"), "warn", 4000);

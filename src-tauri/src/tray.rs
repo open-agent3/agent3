@@ -7,9 +7,40 @@
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
-    AppHandle, Manager,
+    AppHandle, Emitter, Manager,
 };
+use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_updater::UpdaterExt;
+
+#[derive(Clone, serde::Serialize)]
+struct StatusPayload {
+    state: String,
+    message: Option<String>,
+}
+
+fn emit_status(app: &tauri::AppHandle, state: &str, message: Option<String>) {
+    if let Err(e) = app.emit(
+        "agent-status",
+        StatusPayload {
+            state: state.to_string(),
+            message,
+        },
+    ) {
+        log::warn!("[Updater] Emit status failed: {}", e);
+    }
+}
+
+fn notify_update(app: &tauri::AppHandle, body: &str) {
+    if let Err(e) = app
+        .notification()
+        .builder()
+        .title("Agent3 Updater")
+        .body(body)
+        .show()
+    {
+        log::warn!("[Updater] Native notification failed: {}", e);
+    }
+}
 
 pub fn open_config_window(app: &AppHandle) -> Result<(), String> {
     if let Some(win) = app.get_webview_window("config") {
@@ -79,31 +110,79 @@ pub fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 /// Check for OTA updates and install if available
 async fn check_for_updates(app: tauri::AppHandle) {
     log::info!("[Updater] Checking for updates...");
+    notify_update(&app, "Checking for updates...");
+    emit_status(
+        &app,
+        "update-checking",
+        Some("Checking for updates...".to_string()),
+    );
+
     let updater = match app.updater_builder().build() {
         Ok(u) => u,
         Err(e) => {
             log::error!("[Updater] Builder error: {}", e);
+            notify_update(&app, &format!("Update initialization failed: {}", e));
+            emit_status(
+                &app,
+                "update-error",
+                Some(format!("Update initialization failed: {}", e)),
+            );
             return;
         }
     };
+
     match updater.check().await {
         Ok(Some(update)) => {
             log::info!("[Updater] Update available: v{}", update.version);
+            notify_update(
+                &app,
+                &format!("Found new version v{}. Downloading now...", update.version),
+            );
+            emit_status(
+                &app,
+                "update-available",
+                Some(format!("Found new version v{}", update.version)),
+            );
+
             match update.download_and_install(|_, _| {}, || {}).await {
                 Ok(()) => {
                     log::info!("[Updater] Update installed, restarting...");
+                    notify_update(&app, "Update installed. Restarting now...");
+                    emit_status(
+                        &app,
+                        "update-installed",
+                        Some("Update installed. Restarting now...".to_string()),
+                    );
                     app.restart();
                 }
                 Err(e) => {
                     log::error!("[Updater] Download/install failed: {}", e);
+                    notify_update(&app, &format!("Update download/install failed: {}", e));
+                    emit_status(
+                        &app,
+                        "update-error",
+                        Some(format!("Update download/install failed: {}", e)),
+                    );
                 }
             }
         }
         Ok(None) => {
             log::info!("[Updater] Already up to date");
+            notify_update(&app, "You are already on the latest version");
+            emit_status(
+                &app,
+                "update-none",
+                Some("You are already on the latest version".to_string()),
+            );
         }
         Err(e) => {
             log::error!("[Updater] Check failed: {}", e);
+            notify_update(&app, &format!("Update check failed: {}", e));
+            emit_status(
+                &app,
+                "update-error",
+                Some(format!("Update check failed: {}", e)),
+            );
         }
     }
 }
