@@ -247,7 +247,6 @@ pub fn run() {
                 .inner_size(960.0, 720.0)
                 .resizable(true)
                 .decorations(true)
-                .transparent(false)
                 .center()
                 .build();
             }

@@ -23,7 +23,6 @@ pub fn open_config_window(app: &AppHandle) -> Result<(), String> {
         .inner_size(960.0, 720.0)
         .resizable(true)
         .decorations(true)
-        .transparent(false)
         .center()
         .build()
         .map(|_| ())
