@@ -255,6 +255,10 @@ fn detect_proxy(target_url: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
         // 2. Fallback: Windows registry system proxy
         .or_else(read_windows_system_proxy)
+        // 3. Fallback: Linux desktop system proxy (GNOME)
+        .or_else(|| read_linux_system_proxy(is_tls))
+        // 4. Fallback: macOS system proxy (scutil)
+        .or_else(|| read_macos_system_proxy(is_tls))
         .filter(|s| !s.is_empty())?;
 
     log::info!("[RealtimeWS] Detected proxy: {}", proxy);
@@ -263,7 +267,9 @@ fn detect_proxy(target_url: &str) -> Option<String> {
     let no_proxy = std::env::var("NO_PROXY")
         .or_else(|_| std::env::var("no_proxy"))
         .ok()
-        .or_else(read_windows_proxy_override);
+        .or_else(read_windows_proxy_override)
+        .or_else(read_linux_proxy_override)
+        .or_else(read_macos_proxy_override);
 
     if let Some(no_proxy) = no_proxy {
         if let Some((host, _)) = parse_host_port(target_url) {
@@ -285,6 +291,223 @@ fn detect_proxy(target_url: &str) -> Option<String> {
     }
 
     Some(proxy)
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_system_proxy(is_tls: bool) -> Option<String> {
+    // GNOME proxy mode must be manual to have host/port values.
+    let mode = gsettings_get("org.gnome.system.proxy", "mode")?;
+    let mode = mode.trim_matches('\'').trim();
+    if mode != "manual" {
+        return None;
+    }
+
+    // Prefer protocol-specific proxy, then fallback to SOCKS.
+    let schema = if is_tls {
+        "org.gnome.system.proxy.https"
+    } else {
+        "org.gnome.system.proxy.http"
+    };
+
+    let host = gsettings_get(schema, "host")
+        .map(|s| s.trim_matches('\'').trim().to_string())
+        .filter(|s| !s.is_empty());
+    let port = gsettings_get(schema, "port").and_then(|s| s.parse::<u16>().ok());
+
+    if let (Some(host), Some(port)) = (host, port) {
+        if port > 0 {
+            return Some(format!("http://{}:{}", host, port));
+        }
+    }
+
+    let socks_host = gsettings_get("org.gnome.system.proxy.socks", "host")
+        .map(|s| s.trim_matches('\'').trim().to_string())
+        .filter(|s| !s.is_empty());
+    let socks_port =
+        gsettings_get("org.gnome.system.proxy.socks", "port").and_then(|s| s.parse::<u16>().ok());
+
+    if let (Some(host), Some(port)) = (socks_host, socks_port) {
+        if port > 0 {
+            return Some(format!("http://{}:{}", host, port));
+        }
+    }
+
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_linux_system_proxy(_is_tls: bool) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_proxy_override() -> Option<String> {
+    // GNOME stores this as a list, e.g. ['localhost', '127.0.0.0/8', '*.example.com']
+    let raw = gsettings_get("org.gnome.system.proxy", "ignore-hosts")?;
+    let normalized = raw
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .split(',')
+        .map(|s| s.trim().trim_matches('\''))
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_linux_proxy_override() -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn read_macos_system_proxy(is_tls: bool) -> Option<String> {
+    let dump = read_macos_scutil_proxy_dump()?;
+
+    // Prefer protocol-specific proxy, then fallback to SOCKS.
+    if is_tls {
+        let enabled = read_macos_proxy_value(&dump, "HTTPSEnable");
+        let host = read_macos_proxy_value(&dump, "HTTPSProxy");
+        let port = read_macos_proxy_value(&dump, "HTTPSPort").and_then(|s| s.parse::<u16>().ok());
+        if enabled.as_deref() == Some("1") {
+            if let (Some(host), Some(port)) = (host, port) {
+                if !host.is_empty() && port > 0 {
+                    return Some(format!("http://{}:{}", host, port));
+                }
+            }
+        }
+    } else {
+        let enabled = read_macos_proxy_value(&dump, "HTTPEnable");
+        let host = read_macos_proxy_value(&dump, "HTTPProxy");
+        let port = read_macos_proxy_value(&dump, "HTTPPort").and_then(|s| s.parse::<u16>().ok());
+        if enabled.as_deref() == Some("1") {
+            if let (Some(host), Some(port)) = (host, port) {
+                if !host.is_empty() && port > 0 {
+                    return Some(format!("http://{}:{}", host, port));
+                }
+            }
+        }
+    }
+
+    let socks_enabled = read_macos_proxy_value(&dump, "SOCKSEnable");
+    let socks_host = read_macos_proxy_value(&dump, "SOCKSProxy");
+    let socks_port = read_macos_proxy_value(&dump, "SOCKSPort").and_then(|s| s.parse::<u16>().ok());
+    if socks_enabled.as_deref() == Some("1") {
+        if let (Some(host), Some(port)) = (socks_host, socks_port) {
+            if !host.is_empty() && port > 0 {
+                return Some(format!("http://{}:{}", host, port));
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_macos_system_proxy(_is_tls: bool) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn read_macos_proxy_override() -> Option<String> {
+    let dump = read_macos_scutil_proxy_dump()?;
+    let mut in_exceptions = false;
+    let mut entries: Vec<String> = Vec::new();
+
+    for line in dump.lines() {
+        let trimmed = line.trim();
+
+        if !in_exceptions {
+            if trimmed.starts_with("ExceptionsList") && trimmed.contains("<array>") {
+                in_exceptions = true;
+            }
+            continue;
+        }
+
+        if trimmed == "}" {
+            break;
+        }
+
+        if let Some((_, value)) = trimmed.split_once(':') {
+            let item = value.trim();
+            if !item.is_empty() {
+                entries.push(item.to_string());
+            }
+        }
+    }
+
+    if entries.is_empty() {
+        None
+    } else {
+        Some(entries.join(","))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_macos_proxy_override() -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn read_macos_scutil_proxy_dump() -> Option<String> {
+    use std::process::Command;
+
+    let output = Command::new("scutil").arg("--proxy").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout).to_string();
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn read_macos_proxy_value(dump: &str, key: &str) -> Option<String> {
+    for line in dump.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with(key) {
+            continue;
+        }
+
+        if let Some((_, value)) = trimmed.split_once(':') {
+            let value = value.trim();
+            if value.is_empty() {
+                return None;
+            }
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn gsettings_get(schema: &str, key: &str) -> Option<String> {
+    use std::process::Command;
+
+    let output = Command::new("gsettings")
+        .args(["get", schema, key])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() || value == "'none'" {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 /// Read Windows registry system proxy (Internet Settings)

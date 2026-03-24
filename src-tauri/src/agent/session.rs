@@ -719,6 +719,8 @@ async fn run_event_loop(
 ) -> LoopExit {
     // Accumulate transcript delta, send complete text to memory on ResponseDone
     let mut transcript_buf = String::new();
+    // Accumulate user transcript chunks and persist one consolidated message per turn.
+    let mut user_transcript_buf = String::new();
     // Pending tool calls accumulated within a single response (batch submit on ResponseDone)
     let mut pending_tool_calls: Vec<task_manager::TaskRequest> = Vec::new();
     // Number of outstanding tools being executed
@@ -743,6 +745,7 @@ async fn run_event_loop(
                         }
                     }
                     None => {
+                        flush_user_transcript(memory, &mut user_transcript_buf, &mut user_turn_count).await;
                         return LoopExit::Stopped;
                     }
                 }
@@ -752,6 +755,7 @@ async fn run_event_loop(
             wake = wake_rx.recv() => {
                 if matches!(wake, Some(WakeEvent::Timeout)) {
                     task_mgr.abort_all();
+                    flush_user_transcript(memory, &mut user_transcript_buf, &mut user_turn_count).await;
                     return LoopExit::WakeTimeout(user_turn_count);
                 }
             }
@@ -764,7 +768,7 @@ async fn run_event_loop(
                         log::debug!("[Session] WS Text: {}", preview);
                         let (replies, exit) = handle_ws_message(
                             app, protocol, memory, playback_tx,
-                            &raw, &mut transcript_buf, &mut pending_tool_calls,
+                            &raw, &mut transcript_buf, &mut user_transcript_buf, &mut pending_tool_calls,
                             &task_mgr, &mut tools_in_flight,
                             &mut consecutive_tool_rounds,
                             flags,
@@ -787,7 +791,7 @@ async fn run_event_loop(
                         if let Ok(text) = std::str::from_utf8(&data) {
                             let (replies, exit) = handle_ws_message(
                                 app, protocol, memory, playback_tx,
-                                text, &mut transcript_buf, &mut pending_tool_calls,
+                                text, &mut transcript_buf, &mut user_transcript_buf, &mut pending_tool_calls,
                                 &task_mgr, &mut tools_in_flight,
                                 &mut consecutive_tool_rounds,
                                 flags,
@@ -802,6 +806,8 @@ async fn run_event_loop(
                                 }
                             }
                             if let Some(e) = exit {
+                                flush_user_transcript(memory, &mut user_transcript_buf, &mut user_turn_count).await;
+                                flush_user_transcript(memory, &mut user_transcript_buf, &mut user_turn_count).await;
                                 return e;
                             }
                         }
@@ -811,15 +817,18 @@ async fn run_event_loop(
                             log::info!("[Session] WebSocket closed: code={}, reason={}", f.code, f.reason);
                             // Gemini 1008 (Policy): audio + tool call conflict
                             if f.code == tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy {
+                                flush_user_transcript(memory, &mut user_transcript_buf, &mut user_turn_count).await;
                                 return LoopExit::Disconnected1008;
                             }
                         } else {
                             log::info!("[Session] WebSocket closed (no close frame)");
                         }
+                        flush_user_transcript(memory, &mut user_transcript_buf, &mut user_turn_count).await;
                         return LoopExit::Disconnected;
                     }
                     None => {
                         log::info!("[Session] WebSocket stream ended");
+                        flush_user_transcript(memory, &mut user_transcript_buf, &mut user_turn_count).await;
                         return LoopExit::Disconnected;
                     }
                     Some(Err(e)) => {
@@ -828,6 +837,7 @@ async fn run_event_loop(
                             state: "error".into(),
                             message: Some(format!("{}", e)),
                         }) { log::warn!("[Session] Emit event error: {}", e); }
+                        flush_user_transcript(memory, &mut user_transcript_buf, &mut user_turn_count).await;
                         return LoopExit::Disconnected;
                     }
                     _ => {}
@@ -943,16 +953,19 @@ async fn run_event_loop(
                     Some(SessionCommand::Stop) | None => {
                         task_mgr.abort_all();
                         subagent_mgr.abort_all();
+                        flush_user_transcript(memory, &mut user_transcript_buf, &mut user_turn_count).await;
                         return LoopExit::Stopped;
                     }
                     Some(SessionCommand::Reconnect(new_voice)) => {
                         task_mgr.abort_all();
+                        flush_user_transcript(memory, &mut user_transcript_buf, &mut user_turn_count).await;
                         return LoopExit::Reconnect(new_voice);
                     }
                     Some(SessionCommand::Disconnect) => {
                         log::info!("[Session] Disconnect requested, waiting for AI farewell...");
                         // Wait up to 3s for AI to finish speaking, then disconnect
                         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                        flush_user_transcript(memory, &mut user_transcript_buf, &mut user_turn_count).await;
                         return LoopExit::WakeTimeout(user_turn_count); // Return to sleeping
                     }
                     Some(SessionCommand::Wake) => {} // Already connected, ignore
@@ -972,6 +985,7 @@ async fn handle_ws_message(
     playback_tx: &mpsc::Sender<PlaybackCommand>,
     raw: &str,
     transcript_buf: &mut String,
+    user_transcript_buf: &mut String,
     pending_tool_calls: &mut Vec<task_manager::TaskRequest>,
     task_mgr: &task_manager::TaskManager,
     tools_in_flight: &mut usize,
@@ -997,6 +1011,8 @@ async fn handle_ws_message(
             }
             realtime_ws::WsEvent::AudioDone => {}
             realtime_ws::WsEvent::ResponseStart => {
+                // User turn ended. Persist one consolidated user message before assistant reply starts.
+                flush_user_transcript(memory, user_transcript_buf, user_turn_count).await;
                 // Mark AI as speaking — suppresses mic immediately via is_ai_speaking flag
                 flags.is_ai_speaking.store(true, Ordering::Relaxed);
                 // Clear server-side audio buffer to discard any echo that leaked before local gating
@@ -1092,7 +1108,6 @@ async fn handle_ws_message(
                 log::info!("[Session] 🎤 User: {}", text);
                 // New user speech resets the tool round counter
                 *consecutive_tool_rounds = 0;
-                *user_turn_count += 1;
                 if let Err(e) = app.emit(
                     "agent-transcript",
                     TranscriptPayload {
@@ -1102,9 +1117,8 @@ async fn handle_ws_message(
                 ) {
                     log::warn!("[Session] Emit event error: {}", e);
                 }
-                // Only forward transcript for persistence — do NOT trigger interrupt here.
-                // Interrupts are handled by the Realtime API's server VAD natively.
-                let _ = memory.persist("user", &text).await;
+                // Merge incremental transcription chunks and defer persistence until turn end.
+                merge_user_transcript_chunk(user_transcript_buf, &text);
             }
             realtime_ws::WsEvent::FunctionCall {
                 call_id,
@@ -1214,6 +1228,8 @@ async fn handle_ws_message(
             }
             realtime_ws::WsEvent::ResponseDone => {
                 log::info!("[Session] Response completed");
+                // Fallback flush for providers/events that may not emit ResponseStart.
+                flush_user_transcript(memory, user_transcript_buf, user_turn_count).await;
                 // Clear AI speaking flag — playback buffer + echo tail handle the remaining audio
                 flags.is_ai_speaking.store(false, Ordering::Relaxed);
                 // Persist accumulated transcript to memory
@@ -1265,4 +1281,58 @@ async fn handle_ws_message(
         }
     }
     (replies, None)
+}
+
+fn merge_user_transcript_chunk(buffer: &mut String, chunk: &str) {
+    let chunk = chunk.trim();
+    if chunk.is_empty() {
+        return;
+    }
+
+    if buffer.is_empty() {
+        buffer.push_str(chunk);
+        return;
+    }
+
+    let current = buffer.as_str();
+
+    // Some providers resend cumulative transcript; keep the latest full form instead of duplicating.
+    if chunk.starts_with(current) {
+        *buffer = chunk.to_string();
+        return;
+    }
+
+    // Ignore duplicate/replayed tails.
+    if current.ends_with(chunk) {
+        return;
+    }
+
+    let needs_space = current
+        .chars()
+        .last()
+        .map(|c| c.is_alphanumeric())
+        .unwrap_or(false)
+        && chunk
+            .chars()
+            .next()
+            .map(|c| c.is_alphanumeric())
+            .unwrap_or(false);
+    if needs_space {
+        buffer.push(' ');
+    }
+    buffer.push_str(chunk);
+}
+
+async fn flush_user_transcript(
+    memory: &MemoryStore,
+    user_transcript_buf: &mut String,
+    user_turn_count: &mut usize,
+) {
+    if user_transcript_buf.is_empty() {
+        return;
+    }
+
+    let text = std::mem::take(user_transcript_buf);
+    let _ = memory.persist("user", &text).await;
+    *user_turn_count += 1;
 }
