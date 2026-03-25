@@ -1,8 +1,8 @@
 # Agent3 — Project Handoff Document
 
 > **Inspiration**: The movie "Her" — an invisible, ambient system-level AI agent
-> **Tech Stack**: Tauri 2.0 + Vue 3 + TypeScript + Rust + SQLite + Realtime API + cpal + rodio + rustpotter
-> **Last Updated**: 2026-03-21
+> **Tech Stack**: Tauri 2.0 + Vue 3 + TypeScript + Rust + SQLite + Realtime API + tokio-tungstenite + cpal + reqwest + rustpotter
+> **Last Updated**: 2026-03-25
 
 ---
 
@@ -54,11 +54,12 @@ graph TB
         end
 
         subgraph SESSION["🔀 Session Layer"]
-            SessionRS["session.rs<br/>tokio::select! 6-way Multiplexing<br/>Voice I/O + Tool Execution"]
+          SessionRS["session.rs<br/>tokio::select! 7-way Multiplexing<br/>Voice I/O + Tool Execution"]
             WS["realtime_ws.rs<br/>WebSocket Client<br/>OpenAI / Gemini"]
             TaskMgr["task_manager.rs<br/>Async Task Queue<br/>Concurrent Execution + Abortable"]
             SubagentMgr["subagents.rs<br/>Background Subagent Pool<br/>Chat Completions REST"]
-            Tools["tools.rs<br/>13 System Tools<br/>dispatch"]
+          Tools["tools.rs<br/>19 System Tools<br/>dispatch"]
+          MemInject["memory_injection.rs<br/>Scenario Policy + Provider Encoding"]
             Memory["memory.rs<br/>Sync MemoryStore<br/>Persistence + Context Building"]
         end
 
@@ -96,6 +97,7 @@ graph TB
     SubagentMgr -->|REST API| CLOUD
 
     SessionRS -->|persist| Memory
+    SessionRS -->|build/encode pack| MemInject
     Memory <-->|Read / Write| DB
 
     Ambient -->|inject_tx| SessionRS
@@ -146,12 +148,13 @@ src-tauri/src/
     │   └───────────────────────────────────────────┘
     │
     │   ┌─── Session Layer (Voice I/O + Tool Execution + Memory Persistence) ───┐
-    ├── session.rs       — Voice I/O + direct tool execution: Wake wait + WS connection + tokio::select! 6-way multiplexing
+    ├── session.rs       — Voice I/O + direct tool execution: Wake wait + WS connection + tokio::select! 7-way multiplexing
     ├── memory.rs        — Sync MemoryStore: Conversation persistence + system instructions building + context retrieval
+    ├── memory_injection.rs — Provider-agnostic memory injection policy (scenario pack + wire encoding)
     ├── realtime_ws.rs   — Multi-Provider WebSocket Client (OpenAI + Gemini), RealtimeProtocol trait
     ├── task_manager.rs  — Async task queue (Concurrent execution, 3s filler speech, abortable)
     ├── subagents.rs     — Background subagent pool: Chat Completions REST loop, ask_user suspend/resume, isolated toolset
-    ├── tools.rs         — System instructions + 13 tool definitions + dispatch (called by task_manager / subagent)
+    ├── tools.rs         — System instructions + 19 tool definitions + dispatch (WS also adds runtime tool: change_voice)
     │   └────────────────────────────────────────┘
     │
     │   ┌─── Auxiliary Modules ───┐
@@ -169,10 +172,10 @@ src-tauri/src/
                             │
               ┌─────────────▼─────────────┐
               │ Session Layer (session.rs)│  Realtime API WebSocket
-              │ · Voice Capture/Playback  │  · Registers all 13 tools
+              │ · Voice Capture/Playback  │  · Registers 19 tools (+ change_voice)
               │ · Direct tool execution   │  · Auto 3s reconnect
               │ · task_manager concurrency│  · Supports OpenAI + Gemini
-              │ · Holds SubagentManager   │  · Injects context on reconnect
+              │ · Holds SubagentManager   │  · Injects context via memory_injection
               │ · Directly holds MemoryStore│· subagent_event_rx multiplexing
               └──────┬──────────▲─────────┘
     persist()        │          │  inject_rx
@@ -205,11 +208,14 @@ src-tauri/src/
 - MemoryStore is a synchronous struct directly held by the Session — SQLite WAL writes take <1ms, eliminating the need for a channel.
 - Removed the old Orchestrator implementation/file to eliminate dead-code drift; Session + MemoryStore now own that responsibility directly.
 - ambient/scheduler inject directly into the session via a simple String channel without a routing middleware layer.
-- Recent dialogue context is injected upon reconnect (`conversation.item.create`), effectively fixing "amnesia upon reconnection".
+- Reconnect context injection is now split into policy + encoding (`memory_injection.rs`): NewSession / VoiceSwitch / SilentReconnect / ToolRetry scenarios, with continuity brief fallback for providers that do not support timeline injection.
 - SubagentManager runs independently of the Realtime WS — using a REST Chat Completions loop to not block voice dialogue.
 - Subagents inject verbal outcomes via MPSC → session (AskUser/Completed/Failed), following the `inject_tx` pattern.
 - `ask_user` uses oneshot channels to suspend/resume; users answer verbally naturally → Voice AI calls `reply_to_subagent` to forward the response.
 - Subagent toolset excludes `spawn_subagent` to prevent recursive generation, and excludes `observe_screen` to prevent token explosion.
+- Session enforces `MAX_TOOL_ROUNDS = 10` to prevent infinite function-calling loops.
+- Gemini `1008` (audio + tool conflict) is handled by exponential backoff retries and a ToolRetry injection hint.
+- On wake-timeout with meaningful dialogue (`user_turns >= 3`), session can spawn a background consolidation subagent to extract durable user facts.
 
 ### 2.4 Data Flow (Voice + Tool Pipeline)
 
@@ -236,14 +242,21 @@ When tools are needed (Session layer handles directly)
   Realtime API returns function_call
     → session accumulates pending_tool_calls (ResponseDone triggers batch submit)
     → task_manager.submit() concurrent execution           [Task Scheduling]
-      → tools::dispatch_tool() / dispatch_ui_tool()        [Tool Execution]
+      → tools::dispatch_tool_with_app() / dispatch_ui_tool() [Tool Execution]
       → TaskResult → function_call_output sent to WS       [Result Return]
+    → MAX_TOOL_ROUNDS guard (10 rounds) prevents loop runaway [Safety Guard]
     → Realtime API → Model spontaneously synthesizes speech based on tool results [User hears]
 
 User interruption detection
   ← input_audio_buffer.speech_started (server VAD event)
     → task_mgr.abort_all() interrupts running tools        [Cancel running tools]
     → clears pending_tool_calls                            [Clear pending queue]
+
+Gemini conflict resilience
+  ← WS Close code 1008 (Policy Violation: mixed audio + function_call in same turn)
+    → Session marks Disconnected1008                       [Special Exit Path]
+    → Reconnect with exponential backoff + ToolRetry hint  [1..16s capped]
+    → Retry limited by MAX_1008_RETRIES (=3)              [Fail-safe]
 
 Background Subagents (subagents.rs)
   spawn_subagent tool call (Initiated by Voice AI, bypasses task_manager)
@@ -258,4 +271,10 @@ Background Subagents (subagents.rs)
   Frontend Ghost UI (App.vue)
     ← subagent-log event → bottom-left semi-transparent terminal [pointer-events: none]
     → Displays recent 10 logs (task_id + status + message) [Auto-fades out if inactive for 8s]
+
+Post-session memory consolidation
+  wake timeout with sufficient conversation
+    → session reads recent_context(20)
+    → spawn_subagent(goal: extract durable user facts)
+    → subagent uses memory tools to update profile/knowledge when appropriate
 ```
