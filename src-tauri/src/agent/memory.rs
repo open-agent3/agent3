@@ -109,7 +109,7 @@ impl MemoryStore {
             - For relations and world knowledge, use add_knowledge_node and add_knowledge_edge. Establish links between entities.\n\
             - Use search_knowledge when you need to recall something specific the user mentioned before.\n\
                         - If the user asks when we last chatted, call get_last_chat_time first.\n\
-                        - If the user asks whether something was said before (or asks exact prior wording), call query_memory_evidence first; do not guess from vague memory.\n\
+                        - If the user asks whether something was said before (or asks exact prior wording), call query_memory_evidence first; do not guess from vague memory.\n- MOST IMPORTANTLY: You are now only provided with the most recent 3 turns of conversation on start. You MUST use search_knowledge or query_memory_evidence to recall older context. DO NOT GUESS.\n\
               - Be proactive with memory! Don't wait until the conversation ends.\n\n\
               CRITICAL: IF YOU ARE CONNECTED VIA A PLATFORM THAT PROHIBITS COMBINING AUDIO AND FUNCTION CALLS (e.g. Gemini Multimodal Live API), EXECUTING TOOLS AND SPEAKING IN THE SAME TURN MAY CAUSE A PROTOCOL CRASH. TO BE SAFE, WHEN YOU CALL A TOOL OR FUNCTION, YOU SHOULD DO IT SILENTLY WITHOUT GENERATING ANY SPOKEN TEXT/AUDIO IN THAT EXACT SAME RESPONSE ROUND.";
         let language_directive = format!(

@@ -59,6 +59,7 @@ pub enum WsEvent {
     ResponseStart,
     /// Response round complete
     ResponseDone,
+    UserSpeechStarted,
     /// Error
     Error(String),
     /// Other events (silently ignored)
@@ -1110,6 +1111,7 @@ fn parse_openai_event(msg: &Value) -> WsEvent {
             arguments: msg["arguments"].as_str().unwrap_or("{}").to_string(),
         },
         "response.created" => WsEvent::ResponseStart,
+        "input_audio_buffer.speech_started" => WsEvent::UserSpeechStarted,
         "response.done" => {
             let status = msg["response"]["status"].as_str().unwrap_or("completed");
             if status == "failed" {
@@ -1199,7 +1201,7 @@ fn parse_gemini_events(msg: &Value) -> Vec<WsEvent> {
             .unwrap_or(false)
         {
             log::info!("[RealtimeWS] Gemini interrupted by user");
-            return vec![WsEvent::ResponseStart, WsEvent::AudioDone];
+            return vec![WsEvent::UserSpeechStarted];
         }
 
         let turn_complete = sc["turnComplete"].as_bool().unwrap_or(false);

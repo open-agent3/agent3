@@ -454,9 +454,9 @@ async fn session_loop(
                     let greeting = memory.contextual_greeting("voice_switch", None);
                     InjectionScenario::VoiceSwitch { greeting }
                 }
-                ConnectMode::SilentReconnect => InjectionScenario::SilentReconnect { max_turns: 20 },
+                ConnectMode::SilentReconnect => InjectionScenario::SilentReconnect { max_turns: 3 },
                 ConnectMode::ToolRetry => InjectionScenario::ToolRetry {
-                    max_turns: 20,
+                    max_turns: 3,
                     retry_hint: "[System] Your previous response was interrupted because you tried to speak and call a tool at the same time. This time, ONLY execute the tool/function call silently — do NOT generate any spoken audio. After the tool result comes back, you may speak to the user.".to_string(),
                 },
                 ConnectMode::NewSession => {
@@ -1311,26 +1311,36 @@ async fn handle_ws_message(
                     log::warn!("[Session] Emit event error: {}", e);
                 }
             }
-            realtime_ws::WsEvent::Other(event_type) => {
-                // speech_started from server VAD — user is interrupting the AI
-                if event_type == "input_audio_buffer.speech_started" {
-                    // Clear AI speaking flag so mic can open for user
+            realtime_ws::WsEvent::UserSpeechStarted => {
+                let duration = flags.speech_duration_ms.load(Ordering::Relaxed);
+                let peak = f32::from_bits(flags.peak_rms.load(Ordering::Relaxed));
+                
+                log::info!(
+                    "[Session] User speech started detected. Local metrics: duration={}ms, peak_rms={:.3}",
+                    duration, peak
+                );
+
+                if duration < 500 && peak < 0.08 {
+                    // Soft interruption / Backchannel
+                    log::info!("[Session] Soft interruption detected (backchannel). Not interrupting AI.");
+                } else {
+                    // Hard interruption -> full abort
+                    log::info!("[Session] Hard interruption. Stopping playback and aborting tasks.");
                     flags.is_ai_speaking.store(false, Ordering::Relaxed);
-                    // Fade out and clear playback buffer so old audio stops quickly
-                    // and is_playing becomes false, allowing mic to fully open
                     let _ = playback_tx.try_send(PlaybackCommand::FadeOut(100));
                     if *tools_in_flight > 0 {
                         log::info!(
-                            "[Session] User speech detected, aborting {} running tools",
+                            "[Session] Aborting {} running tools due to interrupt",
                             tools_in_flight
                         );
                         task_mgr.abort_all();
                         *tools_in_flight = 0;
                     }
-                } else {
-                    let preview: String = raw.chars().take(300).collect();
-                    log::debug!("[Session] WS event '{}': {}", event_type, preview);
                 }
+            }
+            realtime_ws::WsEvent::Other(event_type) => {
+                let preview: String = raw.chars().take(300).collect();
+                log::debug!("[Session] WS event '{}': {}", event_type, preview);
             }
         }
     }

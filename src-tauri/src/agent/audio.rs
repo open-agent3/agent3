@@ -67,6 +67,10 @@ pub struct SharedAudioFlags {
     pub is_ai_speaking: AtomicBool,
     /// Session connectivity state (0=sleeping, 2=connected)
     pub session_state: AtomicU8,
+    /// Current speech duration (ms) for backchannel/interruption detection
+    pub speech_duration_ms: std::sync::atomic::AtomicU64,
+    /// Peak RMS energy during the current speech event
+    pub peak_rms: std::sync::atomic::AtomicU32,
 }
 
 impl SharedAudioFlags {
@@ -76,6 +80,8 @@ impl SharedAudioFlags {
             is_playing: AtomicBool::new(false),
             is_ai_speaking: AtomicBool::new(false),
             session_state: AtomicU8::new(0),
+            speech_duration_ms: std::sync::atomic::AtomicU64::new(0),
+            peak_rms: std::sync::atomic::AtomicU32::new(0),
         }
     }
 }
@@ -403,6 +409,8 @@ async fn process_loop(
     // VERY IMPORTANT: The OS audio stack and wireless speakers can have up to 300-500ms latency.
     // The tail MUST be long enough to cover the actual physical speaker emit after buffer empties.
     const ECHO_TAIL_MS: u64 = 400;
+    let mut current_speech_start: Option<std::time::Instant> = None;
+    let mut current_peak_rms = 0.0f32;
     let mut prev_ws = WakeState::Sleeping;
     // Energy emission throttle: ~30fps (33ms between emits)
     let mut last_energy_emit = std::time::Instant::now() - std::time::Duration::from_millis(100);
@@ -528,6 +536,22 @@ async fn process_loop(
 
         if rms > gate {
             last_speech = std::time::Instant::now();
+            
+            if current_speech_start.is_none() {
+                current_speech_start = Some(std::time::Instant::now());
+                current_peak_rms = rms;
+                flags.speech_duration_ms.store(0, Ordering::Relaxed);
+                flags.peak_rms.store(rms.to_bits(), Ordering::Relaxed);
+            } else {
+                current_peak_rms = current_peak_rms.max(rms);
+                let duration = current_speech_start.unwrap().elapsed().as_millis() as u64;
+                flags.speech_duration_ms.store(duration, Ordering::Relaxed);
+                flags.peak_rms.store(current_peak_rms.to_bits(), Ordering::Relaxed);
+            }
+        } else if current_speech_start.is_some() {
+            // Speech ended
+            current_speech_start = None;
+            // We can optionally leave the last duration/peak in the flags so session can read it shortly after
         }
 
         // Only send audio frames when Listening (WS connected and consuming)
