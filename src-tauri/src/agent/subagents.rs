@@ -400,6 +400,28 @@ async fn subagent_loop(
         let message = &choice["message"];
         let finish_reason = choice["finish_reason"].as_str().unwrap_or("stop");
 
+        // Extract and emit thought process
+        if let Some(content) = message["content"].as_str() {
+            if !content.trim().is_empty() {
+                let mut display_text = content.to_string();
+                if let (Some(start), Some(end)) = (display_text.find("<thinking>"), display_text.find("</thinking>")) {
+                    if end > start + 10 {
+                        display_text = display_text[start+10..end].to_string();
+                    }
+                }
+                // Clean up newlines for the ghost UI log
+                display_text = display_text.replace('\n', " ").trim().to_string();
+                if !display_text.is_empty() {
+                    emit_log(
+                        &app,
+                        &task_id,
+                        "thinking",
+                        &display_text,
+                    );
+                }
+            }
+        }
+
         // Add assistant message to conversation history
         messages.push(message.clone());
 

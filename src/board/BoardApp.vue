@@ -87,6 +87,15 @@ function sanitizeHtml(input: string): string {
 const sanitizedHtml = computed(() => sanitizeHtml(content.value));
 
 let unlisten: UnlistenFn | null = null;
+let unlistenLog: UnlistenFn | null = null;
+let logTimer: ReturnType<typeof setTimeout> | null = null;
+
+interface SubagentLog {
+  task_id: string;
+  status: string;
+  message: string;
+}
+const subagentLog = ref<SubagentLog | null>(null);
 
 function applyContent(payload: BoardContent) {
   contentType.value = payload.content_type;
@@ -111,10 +120,20 @@ onMounted(async () => {
   unlisten = await listen<BoardContent>("agent-render-ui", (event) => {
     applyContent(event.payload);
   });
+
+  unlistenLog = await listen<SubagentLog>("subagent-log", (event) => {
+    subagentLog.value = event.payload;
+    if (logTimer) clearTimeout(logTimer);
+    logTimer = setTimeout(() => {
+      subagentLog.value = null;
+    }, 15000);
+  });
 });
 
 onUnmounted(() => {
   unlisten?.();
+  unlistenLog?.();
+  if (logTimer) clearTimeout(logTimer);
 });
 </script>
 
@@ -124,6 +143,13 @@ onUnmounted(() => {
       <span class="board-title">{{ t('board.title') }}</span>
       <button class="board-close" @click="closeWindow" :title="t('board.close')">✕</button>
     </header>
+    
+    <div v-if="subagentLog" class="subagent-banner" :class="subagentLog.status">
+      <span class="pulse"></span>
+      <span class="status-badge">{{ subagentLog.status }}</span>
+      <span class="message">{{ subagentLog.message }}</span>
+    </div>
+
     <main class="board-body" v-if="hasContent">
       <pre v-if="contentType === 'code'" class="board-code">{{ content }}</pre>
       <div v-else-if="contentType === 'html'" class="board-html" v-html="sanitizedHtml"></div>
@@ -250,5 +276,52 @@ body {
   padding: 2px 6px;
   border-radius: 4px;
   font-size: 13px;
+}
+
+/* Subagent Banner Styles */
+.subagent-banner {
+  background: #2a2a2a;
+  color: #aaa;
+  padding: 8px 16px;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border-bottom: 1px solid #333;
+  font-family: "Cascadia Code", "Fira Code", monospace;
+  flex-shrink: 0;
+}
+.subagent-banner .pulse {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #ffb86c;
+  animation: subagent-pulse 1.5s infinite;
+  flex-shrink: 0;
+}
+.subagent-banner.thinking .pulse { background: #50fa7b; }
+.subagent-banner.error .pulse { background: #ff5555; }
+.subagent-banner.completed .pulse { background: #bd93f9; animation: none; }
+
+.status-badge {
+  text-transform: uppercase;
+  font-weight: bold;
+  font-size: 11px;
+  color: #fff;
+  background: rgba(255,255,255,0.1);
+  padding: 2px 6px;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+
+.subagent-banner .message {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+@keyframes subagent-pulse {
+  0% { transform: scale(0.95); opacity: 0.5; }
+  50% { transform: scale(1.1); opacity: 1; }
+  100% { transform: scale(0.95); opacity: 0.5; }
 }
 </style>

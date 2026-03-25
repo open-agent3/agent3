@@ -89,11 +89,11 @@ onMounted(async () => {
   subagentUnlisten = await listen<SubagentLog>("subagent-log", (event) => {
     const log = { ...event.payload, ts: Date.now() };
     subagentLogs.value = [...subagentLogs.value.slice(-9), log];
-    // Auto-clear after 8s of inactivity
+    // Auto-clear after 20s of inactivity (extended for long web tool fetches)
     if (ghostFadeTimer) clearTimeout(ghostFadeTimer);
     ghostFadeTimer = setTimeout(() => {
       subagentLogs.value = [];
-    }, 8000);
+    }, 20000);
   });
 
   // Render loop driving CSS variables
