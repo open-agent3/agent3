@@ -304,7 +304,15 @@ pub async fn set_active_provider(
     id: String,
 ) -> Result<(), String> {
     let pool = &state.0;
-    sqlx::query("UPDATE llm_providers SET is_active = 0")
+    let role: String = sqlx::query_scalar("SELECT role FROM llm_providers WHERE id = ?")
+        .bind(&id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Provider not found: {}", id))?;
+
+    sqlx::query("UPDATE llm_providers SET is_active = 0 WHERE role = ?")
+        .bind(&role)
         .execute(pool)
         .await
         .map_err(|e| e.to_string())?;

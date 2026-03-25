@@ -7,6 +7,7 @@ import { t, initLocale, setLocale, locale, type Locale } from "../i18n";
 
 // ---- Type Definitions ----
 type ProviderType = "openai" | "gemini";
+type ProviderRole = "realtime" | "sensory" | "background";
 
 interface Provider {
   id: string;
@@ -16,6 +17,7 @@ interface Provider {
   model: string;
   is_active: boolean;
   provider_type: ProviderType;
+  role: ProviderRole;
 }
 
 interface WakewordInfo {
@@ -35,6 +37,21 @@ const SENSORY_PRESETS: Record<string, { name: string; base_url: string; model: s
     name: "Gemini Multimodal Live",
     base_url: "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent",
     model: "gemini-2.5-flash-native-audio-preview-12-2025",
+    provider_type: "gemini",
+  },
+};
+
+const BACKGROUND_PRESETS: Record<string, { name: string; base_url: string; model: string; provider_type: ProviderType }> = {
+  openai: {
+    name: "OpenAI Long Task",
+    base_url: "https://api.openai.com/v1/chat/completions",
+    model: "gpt-5-mini",
+    provider_type: "openai",
+  },
+  gemini: {
+    name: "Gemini Long Task",
+    base_url: "https://generativelanguage.googleapis.com/v1beta/chat/completions",
+    model: "gemini-2.5-pro",
     provider_type: "gemini",
   },
 };
@@ -95,7 +112,7 @@ const selectedVoice = ref("");
 // ---- Wizard State ----
 type WizardStage = "provider" | "apikey" | "wakeword" | "done";
 const wizardStage = ref<WizardStage>("provider");
-const isFirstRun = computed(() => providers.value.length === 0);
+const isFirstRun = computed(() => providers.value.filter((p) => p.role !== "background").length === 0);
 const showWizard = computed(() => isFirstRun.value || wizardStage.value === "wakeword");
 const wizardProviderType = ref<ProviderType | null>(null);
 const wizardApiKey = ref("");
@@ -104,6 +121,9 @@ const wizardWakewordExpanded = ref(false);
 
 const voiceSwitching = ref(false);
 const showSensoryForm = ref(false);
+const showBackgroundForm = ref(false);
+const sensoryFormError = ref("");
+const backgroundFormError = ref("");
 
 // ---- Autostart State ----
 const autostartEnabled = ref(true);
@@ -120,6 +140,8 @@ const wakewordLastDuration = ref<number | null>(null);
 const wakewordLastQualityHint = ref("");
 const wakewordSetupSkipped = ref(false);
 const wakewordSectionEl = ref<HTMLElement | null>(null);
+const realtimeFormEl = ref<HTMLElement | null>(null);
+const backgroundFormEl = ref<HTMLElement | null>(null);
 let unlistenFocusWakeword: UnlistenFn | null = null;
 
 const wakewordProgress = computed(() => {
@@ -128,7 +150,25 @@ const wakewordProgress = computed(() => {
 });
 
 // ---- Forms ----
-const sensoryForm = ref({ preset: "openai", name: "", base_url: "", api_key: "", model: "", provider_type: "openai" as ProviderType });
+const sensoryForm = ref({
+  preset: "openai",
+  name: "",
+  base_url: "",
+  api_key: "",
+  model: "",
+  provider_type: "openai" as ProviderType,
+  role: "realtime" as ProviderRole,
+});
+
+const backgroundForm = ref({
+  preset: "openai",
+  name: "",
+  base_url: "",
+  api_key: "",
+  model: "",
+  provider_type: "openai" as ProviderType,
+  role: "background" as ProviderRole,
+});
 
 function applySensoryPreset() {
   const p = SENSORY_PRESETS[sensoryForm.value.preset];
@@ -140,13 +180,58 @@ function applySensoryPreset() {
   }
 }
 
+function applyBackgroundPreset() {
+  const p = BACKGROUND_PRESETS[backgroundForm.value.preset];
+  if (p) {
+    backgroundForm.value.name = p.name;
+    backgroundForm.value.base_url = p.base_url;
+    backgroundForm.value.model = p.model;
+    backgroundForm.value.provider_type = p.provider_type;
+  }
+}
+
 // ---- Computed Properties ----
-const realtimeProviders = computed(() => providers.value);
+function isRealtimeRole(role: string): boolean {
+  return role === "realtime" || role === "sensory";
+}
+
+const realtimeProviders = computed(() => providers.value.filter((p) => isRealtimeRole(p.role)));
+const backgroundProviders = computed(() => providers.value.filter((p) => p.role === "background"));
+const activeRealtimeProvider = computed(() => realtimeProviders.value.find((p) => p.is_active));
+const activeBackgroundProvider = computed(() => backgroundProviders.value.find((p) => p.is_active));
+const usesBackgroundFallback = computed(() => !activeBackgroundProvider.value && !!activeRealtimeProvider.value);
+
+function validateProviderForm(form: {
+  name: string;
+  base_url: string;
+  api_key: string;
+  model: string;
+}, role: ProviderRole): string {
+  if (!form.name.trim()) return t("config.provider_error_name");
+
+  const baseUrl = form.base_url.trim();
+  if (role === "background") {
+    const ok =
+      baseUrl.startsWith("https://") ||
+      baseUrl.startsWith("http://") ||
+      baseUrl.startsWith("wss://") ||
+      baseUrl.startsWith("ws://");
+    if (!ok) {
+      return t("config.provider_error_http");
+    }
+  } else if (!(baseUrl.startsWith("wss://") || baseUrl.startsWith("ws://"))) {
+    return t("config.provider_error_ws");
+  }
+
+  if (!form.api_key.trim()) return t("config.provider_error_key");
+  if (!form.model.trim()) return t("config.provider_error_model");
+  return "";
+}
 
 // ---- Operations ----
 async function loadProviders() {
   try {
-    providers.value = await invoke("get_providers");
+    providers.value = await invoke<Provider[]>("get_providers");
   } catch {
     // Rust already logged the error, frontend keeps empty list
   }
@@ -173,6 +258,11 @@ async function saveAgentName() {
 
 async function addProvider() {
   const form = sensoryForm.value;
+  sensoryFormError.value = validateProviderForm(form, "realtime");
+  if (sensoryFormError.value) {
+    showStatus(sensoryFormError.value);
+    return;
+  }
 
   const provider: Provider = {
     id: `provider_${Date.now()}`,
@@ -182,18 +272,69 @@ async function addProvider() {
     model: form.model,
     provider_type: form.provider_type,
     is_active: realtimeProviders.value.length === 0,
+    role: "realtime",
   };
 
   try {
     await invoke("save_provider", { provider });
     await loadProviders();
-    sensoryForm.value = { preset: "openai", name: "", base_url: "", api_key: "", model: "", provider_type: "openai" };
+    sensoryForm.value = {
+      preset: "openai",
+      name: "",
+      base_url: "",
+      api_key: "",
+      model: "",
+      provider_type: "openai",
+      role: "realtime",
+    };
+    sensoryFormError.value = "";
     applySensoryPreset();
     showStatus(t("config.sensory_added"));
     showSensoryForm.value = false;
     await emit("config-changed");
   } catch (e) {
     showStatus(`${t("config.sensory_add_fail_prefix")}${e}`);
+  }
+}
+
+async function addBackgroundProvider() {
+  const form = backgroundForm.value;
+  backgroundFormError.value = validateProviderForm(form, "background");
+  if (backgroundFormError.value) {
+    showStatus(backgroundFormError.value);
+    return;
+  }
+
+  const provider: Provider = {
+    id: `provider_bg_${Date.now()}`,
+    name: form.name,
+    base_url: form.base_url,
+    api_key: form.api_key,
+    model: form.model,
+    provider_type: form.provider_type,
+    is_active: backgroundProviders.value.length === 0,
+    role: "background",
+  };
+
+  try {
+    await invoke("save_provider", { provider });
+    await loadProviders();
+    backgroundForm.value = {
+      preset: "openai",
+      name: "",
+      base_url: "",
+      api_key: "",
+      model: "",
+      provider_type: "openai",
+      role: "background",
+    };
+    backgroundFormError.value = "";
+    applyBackgroundPreset();
+    showStatus(t("config.background_added"));
+    showBackgroundForm.value = false;
+    await emit("config-changed");
+  } catch (e) {
+    showStatus(`${t("config.background_add_fail_prefix")}${e}`);
   }
 }
 
@@ -212,10 +353,20 @@ async function activateProvider(id: string) {
   try {
     await invoke("set_active_provider", { id });
     await loadProviders();
-    showStatus(t("config.sensory_activated"));
+    const provider = providers.value.find((p) => p.id === id);
+    if (provider?.role === "background") {
+      showStatus(t("config.background_activated"));
+    } else {
+      showStatus(t("config.sensory_activated"));
+    }
     await emit("config-changed");
   } catch (e) {
-    showStatus(`${t("config.sensory_activate_fail_prefix")}${e}`);
+    const provider = providers.value.find((p) => p.id === id);
+    if (provider?.role === "background") {
+      showStatus(`${t("config.background_activate_fail_prefix")}${e}`);
+    } else {
+      showStatus(`${t("config.sensory_activate_fail_prefix")}${e}`);
+    }
   }
 }
 
@@ -285,8 +436,22 @@ async function quickConnect() {
         model: sp.model,
         provider_type: sp.provider_type,
         is_active: true,
+        role: "realtime",
       };
       await invoke("save_provider", { provider: sensoryProvider });
+
+      const bp = BACKGROUND_PRESETS[pType];
+      const backgroundProvider: Provider = {
+        id: `provider_bg_${Date.now()}`,
+        name: bp.name,
+        base_url: bp.base_url,
+        api_key: wizardApiKey.value.trim(),
+        model: bp.model,
+        provider_type: bp.provider_type,
+        is_active: true,
+        role: "background",
+      };
+      await invoke("save_provider", { provider: backgroundProvider });
     }
     
     await loadProviders();
@@ -315,6 +480,18 @@ function finishWizard(skipWakeword: boolean) {
 function showStatus(msg: string) {
   statusMsg.value = msg;
   setTimeout(() => (statusMsg.value = ""), 2500);
+}
+
+async function openRealtimeSetup() {
+  showSensoryForm.value = true;
+  await nextTick();
+  realtimeFormEl.value?.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+async function openBackgroundSetup() {
+  showBackgroundForm.value = true;
+  await nextTick();
+  backgroundFormEl.value?.scrollIntoView({ behavior: "smooth", block: "center" });
 }
 
 // ---- Wakeword Operations ----
@@ -492,6 +669,7 @@ onMounted(() => {
   loadAutostart();
   loadVoice();
   applySensoryPreset();
+  applyBackgroundPreset();
   wizardStage.value = "provider";
 
   listen("config-focus-wakeword", async () => {
@@ -754,8 +932,37 @@ onUnmounted(() => {
 
         <!-- ==================== Voice Service ==================== -->
         <div v-show="activeTab === 'sensory'" class="fade-in">
+          <section class="card">
+            <h2>{{ t('config.service_overview_h2') }}</h2>
+            <p class="desc">{{ t('config.service_overview_hint') }}</p>
+            <div class="overview-grid">
+              <div class="overview-item">
+                <span class="overview-label">{{ t('config.service_realtime_label') }}</span>
+                <span class="overview-value" v-if="activeRealtimeProvider">{{ activeRealtimeProvider.name }} · {{ activeRealtimeProvider.model }}</span>
+                <span class="overview-empty" v-else>{{ t('config.service_not_configured') }}</span>
+                <button class="btn ghost sm overview-action" @click="openRealtimeSetup()">
+                  {{ activeRealtimeProvider ? t('config.service_manage_btn') : t('config.service_setup_btn') }}
+                </button>
+              </div>
+              <div class="overview-item">
+                <span class="overview-label">{{ t('config.service_background_label') }}</span>
+                <span class="overview-value" v-if="activeBackgroundProvider">{{ activeBackgroundProvider.name }} · {{ activeBackgroundProvider.model }}</span>
+                <span class="overview-empty" v-else>{{ t('config.service_not_configured') }}</span>
+                <button class="btn ghost sm overview-action" @click="openBackgroundSetup()">
+                  {{ activeBackgroundProvider ? t('config.service_manage_btn') : t('config.service_setup_btn') }}
+                </button>
+              </div>
+            </div>
+            <div class="alert warn" v-if="usesBackgroundFallback">
+              {{ t('config.background_fallback_note') }}
+            </div>
+          </section>
+
           <div v-if="realtimeProviders.length === 0" class="alert info">
             {{ t('config.sensory_banner') }}
+          </div>
+          <div v-if="backgroundProviders.length === 0" class="alert info">
+            {{ t('config.background_banner') }}
           </div>
 
           <section class="card" v-if="realtimeProviders.length > 0">
@@ -782,7 +989,7 @@ onUnmounted(() => {
             ＋ {{ t('config.sensory_add_btn') }}
           </button>
 
-          <section class="card glass-form" v-show="showSensoryForm || realtimeProviders.length === 0">
+          <section ref="realtimeFormEl" class="card glass-form" v-show="showSensoryForm || realtimeProviders.length === 0">
             <h2>{{ t('config.sensory_add_h2') }}</h2>
             <div class="form-grid">
               <div class="input-group">
@@ -815,6 +1022,70 @@ onUnmounted(() => {
               <button v-if="realtimeProviders.length > 0" class="btn ghost" @click="showSensoryForm = false">{{ t('config.add_cancel') }}</button>
               <button class="btn primary" @click="addProvider()">{{ t('config.sensory_add_btn') }}</button>
             </div>
+            <p v-if="sensoryFormError" class="status-tip form-error">{{ sensoryFormError }}</p>
+          </section>
+
+          <section class="card" v-if="backgroundProviders.length > 0">
+            <h2>{{ t('config.background_list_h2') }}</h2>
+            <p class="desc">{{ t('config.background_list_hint') }}</p>
+            <div class="list-group">
+              <div v-for="p in backgroundProviders" :key="p.id" class="list-item" :class="{ active: p.is_active }">
+                <div class="item-main">
+                  <span class="item-title">{{ p.name }}</span>
+                  <div class="item-tags">
+                    <span class="tag brand">{{ p.provider_type === 'gemini' ? 'Gemini' : 'OpenAI' }}</span>
+                    <span class="tag">{{ p.model }}</span>
+                    <span class="tag">{{ t('config.background_role_tag') }}</span>
+                  </div>
+                </div>
+                <div class="item-actions">
+                  <button v-if="!p.is_active" @click="activateProvider(p.id)" class="btn ghost sm">{{ t('config.wakeword_activate') }}</button>
+                  <span v-else class="tag success">{{ t('config.wakeword_activated') }}</span>
+                  <button @click="removeProvider(p.id)" class="btn ghost danger sm">✕</button>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <button v-if="backgroundProviders.length > 0 && !showBackgroundForm" class="btn dashed full-width" @click="showBackgroundForm = true">
+            ＋ {{ t('config.background_add_btn') }}
+          </button>
+
+          <section ref="backgroundFormEl" class="card glass-form" v-show="showBackgroundForm || backgroundProviders.length === 0">
+            <h2>{{ t('config.background_add_h2') }}</h2>
+            <p class="desc">{{ t('config.background_add_hint') }}</p>
+            <div class="form-grid">
+              <div class="input-group">
+                <label>{{ t('config.sensory_preset') }}</label>
+                <div class="select-wrapper">
+                  <select v-model="backgroundForm.preset" @change="applyBackgroundPreset">
+                    <option value="openai">OpenAI (Reasoning)</option>
+                    <option value="gemini">Gemini (Reasoning)</option>
+                  </select>
+                </div>
+              </div>
+              <div class="input-group">
+                <label>{{ t('config.sensory_name') }}</label>
+                <input v-model="backgroundForm.name" />
+              </div>
+              <div class="input-group full">
+                <label>{{ t('config.background_api_base_url') }}</label>
+                <input v-model="backgroundForm.base_url" :placeholder="t('config.background_api_base_placeholder')" />
+              </div>
+              <div class="input-group">
+                <label>{{ t('config.sensory_apikey') }}</label>
+                <input v-model="backgroundForm.api_key" type="password" :placeholder="t('config.sensory_apikey_placeholder')" />
+              </div>
+              <div class="input-group">
+                <label>{{ t('config.sensory_model') }}</label>
+                <input v-model="backgroundForm.model" />
+              </div>
+            </div>
+            <div class="form-actions right">
+              <button v-if="backgroundProviders.length > 0" class="btn ghost" @click="showBackgroundForm = false">{{ t('config.add_cancel') }}</button>
+              <button class="btn primary" @click="addBackgroundProvider()">{{ t('config.background_add_btn') }}</button>
+            </div>
+            <p v-if="backgroundFormError" class="status-tip form-error">{{ backgroundFormError }}</p>
           </section>
 
           <section class="card">
@@ -1185,6 +1456,80 @@ input:checked + .slider:before { transform: translateX(20px); background: #fff; 
   color: var(--c-danger);
   font-size: 13px;
   text-align: center;
+}
+
+.status-tip.form-error {
+  text-align: left;
+  margin-top: 12px;
+  margin-bottom: 0;
+}
+
+.overview-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 12px;
+}
+
+.overview-item {
+  background: rgba(0, 0, 0, 0.2);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-sm);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.overview-label {
+  font-size: 12px;
+  color: var(--c-text-muted);
+}
+
+.overview-value {
+  font-size: 13px;
+  color: var(--c-text-main);
+  word-break: break-word;
+}
+
+.overview-empty {
+  font-size: 13px;
+  color: var(--c-text-muted);
+}
+
+.overview-action {
+  margin-top: 4px;
+  align-self: flex-start;
+}
+
+@media (max-width: 860px) {
+  .scroll-area {
+    padding: 12px 14px 24px;
+  }
+
+  .card {
+    padding: 16px;
+  }
+
+  .input-group-inline {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .form-actions.right {
+    justify-content: stretch;
+  }
+
+  .form-actions.right .btn {
+    flex: 1;
+  }
+
+  .overview-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .grid-picker {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 .wizard-choice-group {
