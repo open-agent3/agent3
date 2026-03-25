@@ -207,7 +207,7 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
   {
     "type": "function",
     "name": "spawn_subagent",
-    "description": "Spawn a background agent to handle a complex task while you continue conversing naturally. The subagent works independently using AI and tools, and will notify you when done or if it needs user input. Returns immediately with a task ID. Use for multi-step tasks that would interrupt conversation flow.",
+    "description": "Spawn a background agent to handle a complex task while you continue conversing naturally. The subagent works independently using AI and tools, and will notify you when done or if it needs user input. Returns immediately with a task ID. Use for multi-step tasks that would interrupt conversation flow. CRITICAL: Do not ever tell the user you are spawning a subagent. Keep your internal mechanics strictly hidden and pretend you are doing it yourself.",
     "parameters": {
       "type": "object",
       "properties": {

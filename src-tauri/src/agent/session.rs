@@ -464,7 +464,7 @@ async fn session_loop(
                         // Mark as onboarded in memory so we don't ask again if we reconnect in this session
                         is_voice_onboarded = true;
 
-                        "First boot. Give a warm one-to-one introduction. Avoid group/broadcast-style wording. Tell the user you can switch voice. Ask whether they want to switch now. If they want to switch, wait for their answer then call `change_voice`. If they keep current voice, call `set_agent_config` with key 'voice_onboarded' and value 'true'. IMPORTANT: when calling a tool/function (such as change_voice or set_agent_config), do not generate spoken text/audio in the same response round; execute the tool silently."
+                        "First boot. Give a warm one-to-one introduction. Avoid group/broadcast-style wording. Tell the user you can switch voice and ask whether they want to switch now. WAIT for the user to answer. DO NOT call any tool in this response. In FUTURE conversational turns, if they say yes, call `change_voice`; if no, call `set_agent_config` with key 'voice_onboarded' and value 'true'."
                         .to_string()
                     } else if let Some(ref desc) = scheduled_task_desc {
                         memory.contextual_greeting("scheduled_task", Some(desc))
@@ -923,8 +923,8 @@ async fn run_event_loop(
                     Some(subagents::SubagentEvent::AskUser { task_id, question }) => {
                         log::info!("[Session] Subagent {} asking user: {}", task_id, question);
                         let prompt = format!(
-                            "[Background task {} needs your input] {}",
-                            task_id, question
+                            "[System: To complete your current task, ask the user the following question naturally: {}]",
+                            question
                         );
                         let msg = protocol.inject_speech_msg(&prompt);
                         if let Err(e) = ws_sink.send(Message::Text(msg.into())).await {
@@ -935,8 +935,8 @@ async fn run_event_loop(
                     Some(subagents::SubagentEvent::Completed { task_id, summary }) => {
                         log::info!("[Session] Subagent {} completed: {}", task_id, summary);
                         let prompt = format!(
-                            "[Background task {} completed] {}",
-                            task_id, summary
+                            "[System: The operation is complete. Tell the user exactly what was done based on this result: {}]",
+                            summary
                         );
                         let msg = protocol.inject_speech_msg(&prompt);
                         if let Err(e) = ws_sink.send(Message::Text(msg.into())).await {
@@ -947,8 +947,8 @@ async fn run_event_loop(
                     Some(subagents::SubagentEvent::Failed { task_id, error }) => {
                         log::info!("[Session] Subagent {} failed: {}", task_id, error);
                         let prompt = format!(
-                            "[Background task {} failed] {}",
-                            task_id, error
+                            "[System: The operation failed with error: {}. Apologize and explain briefly. DO NOT mention 'subagent' or 'background task'.]",
+                            error
                         );
                         let msg = protocol.inject_speech_msg(&prompt);
                         if let Err(e) = ws_sink.send(Message::Text(msg.into())).await {
@@ -1205,7 +1205,11 @@ async fn handle_ws_message(
                     let result = match subagent_mgr.spawn(&goal).await {
                         Ok(task_id) => {
                             log::info!("[Session] Spawned subagent {} for: {}", task_id, goal);
-                            serde_json::json!({"task_id": task_id, "status": "spawned"}).to_string()
+                            serde_json::json!({
+                                "task_id": task_id, 
+                                "status": "spawned", 
+                                "sys_instruction": "Task started in background. CRITICAL: You MUST now immediately speak a brief natural filler like 'Let me check on that' or '我现在去看看' to let the user know you are working on it. Keep your internal mechanics strictly hidden."
+                            }).to_string()
                         }
                         Err(e) => {
                             log::error!("[Session] Failed to spawn subagent: {}", e);

@@ -69,7 +69,8 @@ export class AgentBridge {
       let unlisten: UnlistenFn | null = null;
       unlisten = await listen("config-ready", async () => {
         if (unlisten) unlisten();
-        await this.startAgent();
+        // The backend emits config-ready AFTER it has already started the agent,
+        // so we do not need to call this.startAgent() here.
       });
       this.unlisteners.push(() => { if (unlisten) unlisten(); });
     }
