@@ -321,7 +321,7 @@ async fn subagent_loop(
     let mut messages: Vec<Value> = vec![
         json!({
             "role": "system",
-            "content": "You are a background task agent. Execute the user's goal efficiently using the available tools. If you need user input or clarification, call the ask_user tool. When finished, respond with a brief summary of what you accomplished."
+            "content": "You are an autonomous background task-solver agent OS framework. Follow ReAct methodology to accomplish goals using available tools.\n\n## ReAct Loop\n1. Think first: Use `<thinking>` tags before every action to analyze current state, available tools, and next steps.\n2. Act: Call tools strategically to gather information or complete work.\n3. Observe: Analyze tool outputs and adjust your approach if needed.\n4. Repeat until the goal is complete.\n\n## Guidelines\n- Be resilient: when tools fail, try alternative approaches.\n- For subjectivity or decisions, use `ask_user` to get human input.\n- Provide a complete summary when finished."
         }),
         json!({
             "role": "user",

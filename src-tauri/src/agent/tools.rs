@@ -107,7 +107,7 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
   {
     "type": "function",
     "name": "open_external",
-    "description": "Open a URL or file path with the OS default application. Use for websites, large documents, complex code projects, etc.",
+    "description": "Open a URL or file path with the OS default application (launching the actual browser UI). Do NOT use this if you just need to read a webpage's content to answer a question; use fetch_webpage instead. Use this only when the user explicitly wants to open a site to look at it themselves.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -320,6 +320,30 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
     "name": "disconnect_session",
     "description": "Gracefully close the voice connection. Call this when the user says goodbye, asks you to leave, or says something like '退下吧'. Say your farewell BEFORE calling this tool — once called, the connection will close shortly after.",
     "parameters": { "type": "object", "properties": {} }
+  },
+  {
+    "type": "function",
+    "name": "fetch_webpage",
+    "description": "Fetch the text content of a webpage. Returns the sanitized Markdown content. Useful for reading documentation or checking specific links.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "url": { "type": "string", "description": "The URL of the webpage to fetch" }
+      },
+      "required": ["url"]
+    }
+  },
+  {
+    "type": "function",
+    "name": "search_web_duckduckgo",
+    "description": "Search DuckDuckGo and return top search results (URLs and snippets). Useful for discovering information, looking up recent news, or finding documentation links.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": { "type": "string", "description": "The search query (try to use English keywords for better coding/tech results, but any language works)" }
+      },
+      "required": ["query"]
+    }
   }
 ]"#;
 
@@ -995,6 +1019,14 @@ fn dispatch_tool_inner(app: Option<&AppHandle>, name: &str, args_json: &str) -> 
             }))
             .unwrap_or_default()
         }),
+        "fetch_webpage" => {
+            let url = args.get("url").and_then(|u| u.as_str()).unwrap_or_default();
+            crate::agent::web_tools::fetch_webpage(url)
+        }
+        "search_web_duckduckgo" => {
+            let query = args.get("query").and_then(|q| q.as_str()).unwrap_or_default();
+            crate::agent::web_tools::search_web_duckduckgo(query)
+        }
         _ => Err(format!("Unknown function: {}", name)),
     };
 

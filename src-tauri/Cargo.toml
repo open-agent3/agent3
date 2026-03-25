@@ -31,7 +31,7 @@ futures-util = "0.3"
 log = "0.4"
 urlencoding = "2"
 open = "5"
-reqwest = { version = "0.12", features = ["json", "stream", "native-tls-vendored"] }
+reqwest = { version = "0.12", features = ["json", "stream", "native-tls-vendored", "rustls-tls", "blocking"] }
 uuid = { version = "1", features = ["v4"] }
 xcap = "0.9"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
@@ -46,4 +46,7 @@ tauri-plugin-updater = "2"
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-notification = "2"
 sqlx = { version = "0.8.6", features = ["sqlite", "runtime-tokio", "macros", "chrono", "uuid"] }
+html2md = "0.2.15"
+select = "0.6.1"
+url = "2.5.8"
 

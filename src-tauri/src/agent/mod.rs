@@ -15,6 +15,7 @@ pub mod subagents;
 pub mod task_manager;
 pub mod tools;
 pub mod wakeword;
+pub mod web_tools;
 
 use session::{SessionCommand, SessionHandle};
 use std::sync::atomic::Ordering;
