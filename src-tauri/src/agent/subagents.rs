@@ -567,7 +567,7 @@ fn cleanup(tasks: &Arc<Mutex<HashMap<String, AbortHandle>>>, task_id: &str) {
 
 impl Drop for SubagentManager {
     fn drop(&mut self) {
-        let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        let mut tasks = self.tasks.lock().unwrap_or_else(|e| { log::error!("[Mutex] Poisoned, state corrupted. Propagating panic."); panic!("Mutex poisoned: {}", e); });
         for (id, handle) in tasks.drain() {
             handle.abort();
             log::info!("[Subagent] Aborted task {} on Drop", id);

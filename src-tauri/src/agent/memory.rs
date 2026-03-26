@@ -6,31 +6,30 @@
 ///   2. Build system instructions (agent name + persona + long-term memories)
 ///   3. Retrieve recent conversation context for WS reconnection
 ///   4. Provide greeting/voice-switch prompts
-use crate::db::DbState;
+
 use chrono::{Local, TimeZone, Timelike};
-use tauri::{AppHandle, Manager};
+
 
 // ============================================================
 // MemoryStore
 // ============================================================
 
 pub struct MemoryStore {
-    app: AppHandle,
+    pool: sqlx::SqlitePool,
     session_id: String,
 }
 
 impl MemoryStore {
     /// Create a new MemoryStore.
-    pub fn new(app: AppHandle) -> Self {
+    pub fn new(pool: sqlx::SqlitePool) -> Self {
         let session_id = uuid::Uuid::new_v4().to_string();
-        Self { app, session_id }
+        Self { pool, session_id }
     }
 
     /// Persist a message to the episodic_logs table.
     /// Returns a Result to allow proper error propagation.
     pub async fn persist(&self, role: &str, content: &str) -> Result<(), String> {
-        let db_state = self.app.state::<DbState>();
-        let pool = &db_state.0;
+        let pool = &self.pool;
 
         let id = uuid::Uuid::new_v4().to_string();
         let created_at = chrono::Utc::now().timestamp();
@@ -51,8 +50,7 @@ impl MemoryStore {
 
     /// Build the full system instructions for the Realtime API session.
     pub async fn build_instructions(&self) -> Result<String, String> {
-        let db_state = self.app.state::<DbState>();
-        let pool = &db_state.0;
+        let pool = &self.pool;
 
         // Fetch agent name
         let agent_name: String =
@@ -184,8 +182,7 @@ impl MemoryStore {
         &self,
         max_turns: usize,
     ) -> Result<Vec<(String, String, i64, String)>, String> {
-        let db_state = self.app.state::<DbState>();
-        let pool = &db_state.0;
+        let pool = &self.pool;
 
         crate::db::get_recent_episodes(pool, max_turns)
             .await

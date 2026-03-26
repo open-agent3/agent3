@@ -127,7 +127,7 @@ impl AudioHandle {
     pub fn start_recording(&self) {
         self.record_buffer
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(|e| { log::error!("[Mutex] Poisoned, state corrupted. Propagating panic."); panic!("Mutex poisoned: {}", e); })
             .clear();
         self.recording.store(true, Ordering::Relaxed);
     }
@@ -135,7 +135,7 @@ impl AudioHandle {
     /// Stop recording, return PCM i16 buffer
     pub fn stop_recording(&self) -> Vec<i16> {
         self.recording.store(false, Ordering::Relaxed);
-        let mut buf = self.record_buffer.lock().unwrap_or_else(|e| e.into_inner());
+        let mut buf = self.record_buffer.lock().unwrap_or_else(|e| { log::error!("[Mutex] Poisoned, state corrupted. Propagating panic."); panic!("Mutex poisoned: {}", e); });
         std::mem::take(&mut *buf)
     }
 }

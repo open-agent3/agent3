@@ -193,7 +193,7 @@ pub async fn start(
         },
     );
 
-    let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(4);
+    let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(1024);
 
     let task = tokio::spawn(session_loop(
         app.clone(),
@@ -263,9 +263,9 @@ async fn session_loop(
     flags: Arc<audio::SharedAudioFlags>,
     playback_tx: mpsc::Sender<PlaybackCommand>,
 ) {
-    let memory = MemoryStore::new(app.clone());
+    let memory = MemoryStore::new(app.state::<crate::db::DbState>().0.clone());
     let injection_policy = DefaultMemoryInjectionPolicy;
-    let (subagent_event_tx, mut subagent_event_rx) = mpsc::channel::<subagents::SubagentEvent>(64);
+    let (subagent_event_tx, mut subagent_event_rx) = mpsc::channel::<subagents::SubagentEvent>(1024);
     let subagent_mgr = subagents::SubagentManager::new(app.clone(), subagent_event_tx);
     let mut first_boot = true;
     'outer: loop {
@@ -500,7 +500,7 @@ async fn session_loop(
             }
 
             // Create task manager for tool execution
-            let (task_event_tx, task_event_rx) = mpsc::channel::<task_manager::TaskEvent>(64);
+            let (task_event_tx, task_event_rx) = mpsc::channel::<task_manager::TaskEvent>(1024);
             let task_mgr = task_manager::TaskManager::new(app.clone(), task_event_tx);
 
             // Main event loop
@@ -864,7 +864,9 @@ async fn run_event_loop(
                         log::info!("[Session] Tool {} completed: {} bytes", result.tool_name, result.output.len());
 
                         // Persist tool result to memory
-                        let _ = memory.persist_tool_result(&result.tool_name, &result.output).await;
+                        if let Err(e) = memory.persist_tool_result(&result.tool_name, &result.output).await {
+                            log::error!("[Session] Failed to persist tool result: {}", e);
+                        }
 
                         // Send function_call_output back to WS
                         let output_msg = protocol.function_call_output_msg(
@@ -1053,7 +1055,9 @@ async fn handle_ws_message(
             }
             realtime_ws::WsEvent::TranscriptDone(text) => {
                 transcript_buf.clear();
-                let _ = memory.persist("assistant", &text).await;
+                if let Err(e) = memory.persist("assistant", &text).await {
+                    log::error!("[Session] Failed to persist assistant text: {}", e);
+                }
 
                 // Show a one-time wakeword setup reminder after the first successful
                 // user<->assistant exchange when setup was previously skipped.
@@ -1293,7 +1297,7 @@ async fn handle_ws_message(
                 // Persist accumulated transcript to memory
                 if !transcript_buf.is_empty() {
                     let full_text = std::mem::take(transcript_buf);
-                    let _ = memory.persist("assistant", &full_text).await;
+                    if let Err(e) = memory.persist("assistant", &full_text).await { log::error!("[Session] Failed to persist output: {}", e); }
                 }
                 // Submit any pending tool calls as a batch
                 if !pending_tool_calls.is_empty() {
@@ -1402,6 +1406,6 @@ async fn flush_user_transcript(
     }
 
     let text = std::mem::take(user_transcript_buf);
-    let _ = memory.persist("user", &text).await;
+    if let Err(e) = memory.persist("user", &text).await { log::error!("[Session] Failed to persist user text: {}", e); }
     *user_turn_count += 1;
 }

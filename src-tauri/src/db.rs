@@ -189,12 +189,7 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
 
     for v in current..target {
         let migration_sql = MIGRATIONS[v as usize];
-        if v == 1 {
-            // v2
-            let _ = sqlx::query(migration_sql).execute(pool).await;
-        } else {
-            sqlx::query(migration_sql).execute(pool).await?;
-        }
+        sqlx::query(migration_sql).execute(pool).await?;
 
         let next_version = v + 1;
         let pragma = format!("PRAGMA user_version = {}", next_version);
