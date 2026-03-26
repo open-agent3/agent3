@@ -307,17 +307,22 @@ pub async fn save_provider(
     // Determine what to store in DB for the api_key column.
     // If the frontend sent back the sentinel (key unchanged), keep it as-is.
     // Otherwise store the new key in the platform keyring and write the sentinel to DB.
-    let db_api_key = if provider.api_key.is_empty() || provider.api_key == crate::keystore::KEYRING_SENTINEL {
-        provider.api_key.clone()
-    } else {
-        match crate::keystore::store_key(&provider.id, &provider.api_key) {
-            Ok(()) => crate::keystore::KEYRING_SENTINEL.to_string(),
-            Err(e) => {
-                log::warn!("[DB] Cannot store key in keyring for '{}' ({}), keeping in DB", provider.id, e);
-                provider.api_key.clone()
+    let db_api_key =
+        if provider.api_key.is_empty() || provider.api_key == crate::keystore::KEYRING_SENTINEL {
+            provider.api_key.clone()
+        } else {
+            match crate::keystore::store_key(&provider.id, &provider.api_key) {
+                Ok(()) => crate::keystore::KEYRING_SENTINEL.to_string(),
+                Err(e) => {
+                    log::warn!(
+                        "[DB] Cannot store key in keyring for '{}' ({}), keeping in DB",
+                        provider.id,
+                        e
+                    );
+                    provider.api_key.clone()
+                }
             }
-        }
-    };
+        };
 
     sqlx::query(
         "INSERT INTO llm_providers (id, name, base_url, api_key, model, is_active, provider_type, role)

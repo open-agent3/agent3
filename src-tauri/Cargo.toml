@@ -51,4 +51,5 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "linux-
 html2md = "0.2.15"
 select = "0.6.1"
 url = "2.5.8"
+sysinfo = "0.30"
 

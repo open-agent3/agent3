@@ -230,3 +230,108 @@ pub fn write_clipboard(text: String) -> Result<(), String> {
     let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
     clipboard.set_text(text).map_err(|e| e.to_string())
 }
+
+#[tauri::command]
+pub fn list_running_apps() -> Result<Vec<String>, String> {
+    use sysinfo::System;
+    let mut sys = System::new_all();
+    sys.refresh_processes();
+
+    let mut processes: Vec<String> = sys
+        .processes()
+        .values()
+        .map(|p| p.name().to_string())
+        .collect();
+
+    processes.sort();
+    processes.dedup();
+
+    Ok(processes)
+}
+
+#[tauri::command]
+pub fn search_installed_software(keyword: Option<String>) -> Result<Vec<String>, String> {
+    use std::process::Command;
+    let keyword_lower = keyword.unwrap_or_default().to_lowercase();
+
+    #[cfg(target_os = "windows")]
+    {
+        let output = Command::new("powershell")
+            .args(&[
+                "-NoProfile",
+                "-Command",
+                r#"Get-StartApps | Select-Object -Property Name | ConvertTo-Json -Compress"#,
+            ])
+            .output()
+            .map_err(|e| e.to_string())?;
+
+        if !output.status.success() {
+            return Err("Failed to query installed apps".to_string());
+        }
+
+        let json_str = String::from_utf8_lossy(&output.stdout);
+        if let Ok(apps) = serde_json::from_str::<Vec<serde_json::Value>>(&json_str) {
+            let mut results: Vec<String> = apps
+                .into_iter()
+                .filter_map(|val| {
+                    val.get("Name")
+                        .and_then(|n| n.as_str())
+                        .map(|s| s.to_string())
+                })
+                .filter(|name| name.to_lowercase().contains(&keyword_lower))
+                .collect();
+            results.sort();
+            results.dedup();
+            return Ok(results);
+        }
+        return Ok(vec![]);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("mdfind")
+            .args(&["kMDItemContentType", "==", "com.apple.application-bundle"])
+            .output()
+            .map_err(|e| e.to_string())?;
+
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut results: Vec<String> = text
+            .lines()
+            .filter_map(|line| {
+                let path = std::path::Path::new(line);
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_string())
+            })
+            .filter(|name| name.to_lowercase().contains(&keyword_lower))
+            .collect();
+        results.sort();
+        results.dedup();
+        return Ok(results);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut results = Vec::new();
+        if let Ok(entries) = std::fs::read_dir("/usr/share/applications") {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.ends_with(".desktop") {
+                        let app_name = name.trim_end_matches(".desktop").replace("-", " ");
+                        if app_name.to_lowercase().contains(&keyword_lower) {
+                            results.push(app_name);
+                        }
+                    }
+                }
+            }
+        }
+        results.sort();
+        results.dedup();
+        return Ok(results);
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        Ok(vec![])
+    }
+}

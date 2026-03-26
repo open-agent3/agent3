@@ -9,10 +9,19 @@ use chrono::{Local, TimeZone};
 
 /// Session connection scenarios that need context injection.
 pub enum InjectionScenario {
-    NewSession { greeting: String },
-    VoiceSwitch { greeting: String },
-    SilentReconnect { max_turns: usize },
-    ToolRetry { max_turns: usize, retry_hint: String },
+    NewSession {
+        greeting: String,
+    },
+    VoiceSwitch {
+        greeting: String,
+    },
+    SilentReconnect {
+        max_turns: usize,
+    },
+    ToolRetry {
+        max_turns: usize,
+        retry_hint: String,
+    },
 }
 
 /// Provider-agnostic context pack produced by policy.

@@ -6,9 +6,7 @@
 ///   2. Build system instructions (agent name + persona + long-term memories)
 ///   3. Retrieve recent conversation context for WS reconnection
 ///   4. Provide greeting/voice-switch prompts
-
 use chrono::{Local, TimeZone, Timelike};
-
 
 // ============================================================
 // MemoryStore
@@ -166,14 +164,12 @@ impl MemoryStore {
     /// Retrieve recent conversation messages for context injection after WS reconnection.
     /// Returns (role, content) pairs in chronological order (oldest first).
     pub async fn recent_context(&self, max_turns: usize) -> Result<Vec<(String, String)>, String> {
-        self.recent_context_with_meta(max_turns)
-            .await
-            .map(|items| {
-                items
-                    .into_iter()
-                    .map(|(role, content, _created_at, _session_id)| (role, content))
-                    .collect()
-            })
+        self.recent_context_with_meta(max_turns).await.map(|items| {
+            items
+                .into_iter()
+                .map(|(role, content, _created_at, _session_id)| (role, content))
+                .collect()
+        })
     }
 
     /// Retrieve recent conversation messages with metadata.

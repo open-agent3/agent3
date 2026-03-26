@@ -122,7 +122,10 @@ fn playback_thread(
                 }
 
                 let buf_len = {
-                    let mut buf = device.buffer.lock().unwrap_or_else(|e| { log::error!("[Mutex] Poisoned, state corrupted. Propagating panic."); panic!("Mutex poisoned: {}", e); });
+                    let mut buf = device.buffer.lock().unwrap_or_else(|e| {
+                        log::error!("[Mutex] Poisoned, state corrupted. Propagating panic.");
+                        panic!("Mutex poisoned: {}", e);
+                    });
                     buf.extend(samples);
                     flags.is_playing.store(true, Ordering::Relaxed);
                     buf.len()
@@ -147,7 +150,12 @@ fn playback_thread(
                         // Keep latest ~1s, discard stale head
                         let keep = device.device_sample_rate as usize;
                         {
-                            let mut buf = device.buffer.lock().unwrap_or_else(|e| { log::error!("[Mutex] Poisoned, state corrupted. Propagating panic."); panic!("Mutex poisoned: {}", e); });
+                            let mut buf = device.buffer.lock().unwrap_or_else(|e| {
+                                log::error!(
+                                    "[Mutex] Poisoned, state corrupted. Propagating panic."
+                                );
+                                panic!("Mutex poisoned: {}", e);
+                            });
                             if buf.len() > keep {
                                 let drain = buf.len() - keep;
                                 buf.drain(..drain);
@@ -164,7 +172,10 @@ fn playback_thread(
                 }
             }
             PlaybackCommand::FadeOut(duration_ms) => {
-                let mut buf = device.buffer.lock().unwrap_or_else(|e| { log::error!("[Mutex] Poisoned, state corrupted. Propagating panic."); panic!("Mutex poisoned: {}", e); });
+                let mut buf = device.buffer.lock().unwrap_or_else(|e| {
+                    log::error!("[Mutex] Poisoned, state corrupted. Propagating panic.");
+                    panic!("Mutex poisoned: {}", e);
+                });
                 let fade_samples = (device.device_sample_rate as u64 * duration_ms / 1000) as usize;
                 let fade_len = fade_samples.min(buf.len());
                 for i in 0..fade_len {
@@ -181,7 +192,10 @@ fn playback_thread(
                 device
                     .buffer
                     .lock()
-                    .unwrap_or_else(|e| { log::error!("[Mutex] Poisoned, state corrupted. Propagating panic."); panic!("Mutex poisoned: {}", e); })
+                    .unwrap_or_else(|e| {
+                        log::error!("[Mutex] Poisoned, state corrupted. Propagating panic.");
+                        panic!("Mutex poisoned: {}", e);
+                    })
                     .clear();
                 flags.is_playing.store(false, Ordering::Relaxed);
                 last_energy = 0.0;

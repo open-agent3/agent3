@@ -83,24 +83,22 @@ pub fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .icon(app.default_window_icon().cloned().expect("no default icon"))
         .menu(&menu)
         .tooltip("Agent3")
-        .on_menu_event(|app, event| {
-            match event.id.as_ref() {
-                "settings" => {
-                    if let Err(e) = open_config_window(app) {
-                        log::warn!("[Tray] Failed to open settings window: {}", e);
-                    }
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "settings" => {
+                if let Err(e) = open_config_window(app) {
+                    log::warn!("[Tray] Failed to open settings window: {}", e);
                 }
-                "check-update" => {
-                    let app_handle = app.clone();
-                    tauri::async_runtime::spawn(async move {
-                        check_for_updates(app_handle).await;
-                    });
-                }
-                "quit" => {
-                    app.exit(0);
-                }
-                _ => {}
             }
+            "check-update" => {
+                let app_handle = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    check_for_updates(app_handle).await;
+                });
+            }
+            "quit" => {
+                app.exit(0);
+            }
+            _ => {}
         })
         .build(app)?;
 

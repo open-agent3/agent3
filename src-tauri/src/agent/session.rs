@@ -181,17 +181,19 @@ pub async fn start(
     .ok()
     .flatten();
 
-    let v: Option<String> = sqlx::query_scalar("SELECT value FROM app_settings WHERE key = 'voice_name'")
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
+    let v: Option<String> =
+        sqlx::query_scalar("SELECT value FROM app_settings WHERE key = 'voice_name'")
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
 
-    let onboarded: Option<String> = sqlx::query_scalar("SELECT value FROM app_settings WHERE key = 'voice_onboarded'")
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
+    let onboarded: Option<String> =
+        sqlx::query_scalar("SELECT value FROM app_settings WHERE key = 'voice_onboarded'")
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
 
     let (provider_info, voice, is_voice_onboarded) = (
         provider,
@@ -326,7 +328,8 @@ async fn session_loop(
 ) {
     let memory = MemoryStore::new(app.state::<crate::db::DbState>().0.clone());
     let injection_policy = DefaultMemoryInjectionPolicy;
-    let (subagent_event_tx, mut subagent_event_rx) = mpsc::channel::<subagents::SubagentEvent>(1024);
+    let (subagent_event_tx, mut subagent_event_rx) =
+        mpsc::channel::<subagents::SubagentEvent>(1024);
     let subagent_mgr = subagents::SubagentManager::new(app.clone(), subagent_event_tx);
     let mut first_boot = true;
     'outer: loop {
@@ -562,7 +565,8 @@ async fn session_loop(
 
             // Create task manager for tool execution
             let (task_event_tx, task_event_rx) = mpsc::channel::<task_manager::TaskEvent>(1024);
-            let task_mgr = task_manager::TaskManager::new(app.clone(), task_event_tx, inject_tx.clone());
+            let task_mgr =
+                task_manager::TaskManager::new(app.clone(), task_event_tx, inject_tx.clone());
 
             // Main event loop
             let exit = run_event_loop(
@@ -644,7 +648,8 @@ async fn session_loop(
                                     .iter()
                                     .filter(|(role, _)| role == "user" || role == "assistant")
                                     .map(|(role, content)| {
-                                        let label = if role == "user" { "User" } else { "Assistant" };
+                                        let label =
+                                            if role == "user" { "User" } else { "Assistant" };
                                         format!("{}: {}", label, content)
                                     })
                                     .collect::<Vec<_>>()
@@ -1050,107 +1055,107 @@ impl SessionLoopState {
         flags: &Arc<audio::SharedAudioFlags>,
         subagent_mgr: &subagents::SubagentManager,
     ) -> (Vec<String>, Option<LoopExit>) {
-    let events = protocol.parse_events(raw);
-    let mut replies: Vec<String> = Vec::new();
+        let events = protocol.parse_events(raw);
+        let mut replies: Vec<String> = Vec::new();
 
-    if events.is_empty() {
-        return (replies, None);
-    }
+        if events.is_empty() {
+            return (replies, None);
+        }
 
-    for event in events {
-        match event {
-            realtime_ws::WsEvent::AudioDelta(base64) => {
-                if let Err(e) = playback_tx.try_send(PlaybackCommand::Enqueue(base64)) {
-                    log::warn!("[Session] Failed to send audio to playback: {}", e);
+        for event in events {
+            match event {
+                realtime_ws::WsEvent::AudioDelta(base64) => {
+                    if let Err(e) = playback_tx.try_send(PlaybackCommand::Enqueue(base64)) {
+                        log::warn!("[Session] Failed to send audio to playback: {}", e);
+                    }
                 }
-            }
-            realtime_ws::WsEvent::AudioDone => {}
-            realtime_ws::WsEvent::ResponseStart => {
-                self.response_done_handled_for_turn = false;
-                // User turn ended. Persist one consolidated user message before assistant reply starts.
-                self.flush_user_transcript(memory).await;
-                // Mark AI as speaking — suppresses mic immediately via is_ai_speaking flag
-                flags.is_ai_speaking.store(true, Ordering::Relaxed);
-                // Clear server-side audio buffer to discard any echo that leaked before local gating
-                if let Some(clear_msg) = protocol.input_audio_clear_msg() {
-                    replies.push(clear_msg);
+                realtime_ws::WsEvent::AudioDone => {}
+                realtime_ws::WsEvent::ResponseStart => {
+                    self.response_done_handled_for_turn = false;
+                    // User turn ended. Persist one consolidated user message before assistant reply starts.
+                    self.flush_user_transcript(memory).await;
+                    // Mark AI as speaking — suppresses mic immediately via is_ai_speaking flag
+                    flags.is_ai_speaking.store(true, Ordering::Relaxed);
+                    // Clear server-side audio buffer to discard any echo that leaked before local gating
+                    if let Some(clear_msg) = protocol.input_audio_clear_msg() {
+                        replies.push(clear_msg);
+                    }
+                    // New reply starting: fade out previous audio (200ms) instead of hard cut
+                    let _ = playback_tx.try_send(PlaybackCommand::FadeOut(200));
                 }
-                // New reply starting: fade out previous audio (200ms) instead of hard cut
-                let _ = playback_tx.try_send(PlaybackCommand::FadeOut(200));
-            }
-            realtime_ws::WsEvent::Transcript(text) => {
-                log::info!("[Session] 🤖 Assistant: {}", text);
-                self.transcript_buf.push_str(&text);
-                if let Err(e) = app.emit(
-                    "agent-transcript",
-                    TranscriptPayload {
-                        role: "assistant".into(),
-                        text: text.clone(),
-                    },
-                ) {
-                    log::warn!("[Session] Emit event error: {}", e);
+                realtime_ws::WsEvent::Transcript(text) => {
+                    log::info!("[Session] 🤖 Assistant: {}", text);
+                    self.transcript_buf.push_str(&text);
+                    if let Err(e) = app.emit(
+                        "agent-transcript",
+                        TranscriptPayload {
+                            role: "assistant".into(),
+                            text: text.clone(),
+                        },
+                    ) {
+                        log::warn!("[Session] Emit event error: {}", e);
+                    }
                 }
-            }
-            realtime_ws::WsEvent::TranscriptDone(text) => {
-                self.transcript_buf.clear();
-                if let Err(e) = memory.persist("assistant", &text).await {
-                    log::error!("[Session] Failed to persist assistant text: {}", e);
-                }
+                realtime_ws::WsEvent::TranscriptDone(text) => {
+                    self.transcript_buf.clear();
+                    if let Err(e) = memory.persist("assistant", &text).await {
+                        log::error!("[Session] Failed to persist assistant text: {}", e);
+                    }
 
-                // Show a one-time wakeword setup reminder after the first successful
-                // user<->assistant exchange when setup was previously skipped.
-                if self.user_turn_count > 0
-                    && !text.trim().is_empty()
-                    && !self.wakeword_nudge_checked
-                {
-                    self.wakeword_nudge_checked = true;
-                    let pool = &app.state::<DbState>().0;
-                    let wake_enabled: Option<String> = sqlx::query_scalar(
-                        "SELECT value FROM app_settings WHERE key = 'wake_word_enabled'",
-                    )
-                    .fetch_optional(pool)
-                    .await
-                    .ok()
-                    .flatten();
-                    let setup_skipped: Option<String> = sqlx::query_scalar(
-                        "SELECT value FROM app_settings WHERE key = 'wakeword_setup_skipped'",
-                    )
-                    .fetch_optional(pool)
-                    .await
-                    .ok()
-                    .flatten();
-                    let nudge_shown: Option<String> = sqlx::query_scalar(
-                        "SELECT value FROM app_settings WHERE key = 'wakeword_nudge_shown'",
-                    )
-                    .fetch_optional(pool)
-                    .await
-                    .ok()
-                    .flatten();
+                    // Show a one-time wakeword setup reminder after the first successful
+                    // user<->assistant exchange when setup was previously skipped.
+                    if self.user_turn_count > 0
+                        && !text.trim().is_empty()
+                        && !self.wakeword_nudge_checked
+                    {
+                        self.wakeword_nudge_checked = true;
+                        let pool = &app.state::<DbState>().0;
+                        let wake_enabled: Option<String> = sqlx::query_scalar(
+                            "SELECT value FROM app_settings WHERE key = 'wake_word_enabled'",
+                        )
+                        .fetch_optional(pool)
+                        .await
+                        .ok()
+                        .flatten();
+                        let setup_skipped: Option<String> = sqlx::query_scalar(
+                            "SELECT value FROM app_settings WHERE key = 'wakeword_setup_skipped'",
+                        )
+                        .fetch_optional(pool)
+                        .await
+                        .ok()
+                        .flatten();
+                        let nudge_shown: Option<String> = sqlx::query_scalar(
+                            "SELECT value FROM app_settings WHERE key = 'wakeword_nudge_shown'",
+                        )
+                        .fetch_optional(pool)
+                        .await
+                        .ok()
+                        .flatten();
 
-                    let wakeword_enabled = wake_enabled
-                        .as_deref()
-                        .map(|v| v == "true" || v == "1")
-                        .unwrap_or(false);
-                    let skipped = setup_skipped
-                        .as_deref()
-                        .map(|v| v == "true" || v == "1")
-                        .unwrap_or(false);
-                    let shown = nudge_shown
-                        .as_deref()
-                        .map(|v| v == "true" || v == "1")
-                        .unwrap_or(false);
+                        let wakeword_enabled = wake_enabled
+                            .as_deref()
+                            .map(|v| v == "true" || v == "1")
+                            .unwrap_or(false);
+                        let skipped = setup_skipped
+                            .as_deref()
+                            .map(|v| v == "true" || v == "1")
+                            .unwrap_or(false);
+                        let shown = nudge_shown
+                            .as_deref()
+                            .map(|v| v == "true" || v == "1")
+                            .unwrap_or(false);
 
-                    if !wakeword_enabled && skipped && !shown {
-                        if let Err(e) = app.emit(
-                            "agent-status",
-                            StatusPayload {
-                                state: "wakeword-nudge".into(),
-                                message: Some(crate::i18n::t("status.wakeword_nudge")),
-                            },
-                        ) {
-                            log::warn!("[Session] Emit wakeword nudge error: {}", e);
-                        }
-                        if let Err(e) = sqlx::query(
+                        if !wakeword_enabled && skipped && !shown {
+                            if let Err(e) = app.emit(
+                                "agent-status",
+                                StatusPayload {
+                                    state: "wakeword-nudge".into(),
+                                    message: Some(crate::i18n::t("status.wakeword_nudge")),
+                                },
+                            ) {
+                                log::warn!("[Session] Emit wakeword nudge error: {}", e);
+                            }
+                            if let Err(e) = sqlx::query(
                             "INSERT INTO app_settings (key, value) VALUES ('wakeword_nudge_shown', 'true') \
                              ON CONFLICT(key) DO UPDATE SET value='true'",
                         )
@@ -1159,249 +1164,257 @@ impl SessionLoopState {
                         {
                             log::warn!("[Session] Failed to persist wakeword_nudge_shown: {}", e);
                         }
+                        }
                     }
                 }
-            }
-            realtime_ws::WsEvent::InputTranscript(text) => {
-                if text.trim().is_empty() {
-                    log::debug!("[Session] Ignored blank user transcript chunk");
-                    continue;
+                realtime_ws::WsEvent::InputTranscript(text) => {
+                    if text.trim().is_empty() {
+                        log::debug!("[Session] Ignored blank user transcript chunk");
+                        continue;
+                    }
+                    self.response_done_handled_for_turn = false;
+                    log::info!("[Session] 🎤 User: {}", text);
+                    // New user speech resets the tool round counter
+                    self.consecutive_tool_rounds = 0;
+                    if self.user_transcript_buf.is_empty() && !text.trim().is_empty() {
+                        self.user_turn_started_at = Some(chrono::Utc::now().timestamp());
+                    }
+                    if let Err(e) = app.emit(
+                        "agent-transcript",
+                        TranscriptPayload {
+                            role: "user".into(),
+                            text: text.clone(),
+                        },
+                    ) {
+                        log::warn!("[Session] Emit event error: {}", e);
+                    }
+                    // Merge incremental transcription chunks and defer persistence until turn end.
+                    merge_user_transcript_chunk(&mut self.user_transcript_buf, &text);
                 }
-                self.response_done_handled_for_turn = false;
-                log::info!("[Session] 🎤 User: {}", text);
-                // New user speech resets the tool round counter
-                self.consecutive_tool_rounds = 0;
-                if self.user_transcript_buf.is_empty() && !text.trim().is_empty() {
-                    self.user_turn_started_at = Some(chrono::Utc::now().timestamp());
-                }
-                if let Err(e) = app.emit(
-                    "agent-transcript",
-                    TranscriptPayload {
-                        role: "user".into(),
-                        text: text.clone(),
-                    },
-                ) {
-                    log::warn!("[Session] Emit event error: {}", e);
-                }
-                // Merge incremental transcription chunks and defer persistence until turn end.
-                merge_user_transcript_chunk(&mut self.user_transcript_buf, &text);
-            }
-            realtime_ws::WsEvent::FunctionCall {
-                call_id,
-                name,
-                arguments,
-            } => {
-                let mut effective_arguments = arguments;
-                if name == "change_voice" {
-                    let args: Value =
-                        serde_json::from_str(&effective_arguments).unwrap_or(serde_json::json!({}));
-                    let voice_name = args["voice_name"].as_str().unwrap_or("").to_string();
-                    log::info!("[Session] Change voice requested: {}", voice_name);
+                realtime_ws::WsEvent::FunctionCall {
+                    call_id,
+                    name,
+                    arguments,
+                } => {
+                    let mut effective_arguments = arguments;
+                    if name == "change_voice" {
+                        let args: Value = serde_json::from_str(&effective_arguments)
+                            .unwrap_or(serde_json::json!({}));
+                        let voice_name = args["voice_name"].as_str().unwrap_or("").to_string();
+                        log::info!("[Session] Change voice requested: {}", voice_name);
 
-                    // Validate voice name against known providers
-                    let valid = protocol.is_valid_voice(&voice_name);
-                    if !valid {
-                        log::warn!("[Session] Rejected invalid voice name: {}", voice_name);
-                        replies.push(protocol.function_call_output_msg(
+                        // Validate voice name against known providers
+                        let valid = protocol.is_valid_voice(&voice_name);
+                        if !valid {
+                            log::warn!("[Session] Rejected invalid voice name: {}", voice_name);
+                            replies.push(protocol.function_call_output_msg(
                         &call_id, &name,
                         &format!("{{\"error\":\"Unknown voice '{}'. Use one of the supported voice names.\"}}", voice_name),
                     ));
-                        return (replies, None);
-                    }
+                            return (replies, None);
+                        }
 
-                    // Write to DB
-                    let pool = &app.state::<DbState>().0;
-                    if let Ok(mut tx) = pool.begin().await {
-                        let res1 = sqlx::query("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('voice_name', ?1)")
+                        // Write to DB
+                        let pool = &app.state::<DbState>().0;
+                        if let Ok(mut tx) = pool.begin().await {
+                            let res1 = sqlx::query("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('voice_name', ?1)")
                             .bind(&voice_name)
                             .execute(&mut *tx)
                             .await;
-                        let res2 = sqlx::query("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('voice_onboarded', 'true')")
+                            let res2 = sqlx::query("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('voice_onboarded', 'true')")
                             .execute(&mut *tx)
                             .await;
-                        if res1.is_ok() && res2.is_ok() {
-                            let _ = tx.commit().await;
+                            if res1.is_ok() && res2.is_ok() {
+                                let _ = tx.commit().await;
+                            } else {
+                                log::error!("[Session] Failed to persist voice settings");
+                                let _ = tx.rollback().await;
+                            }
                         } else {
-                            log::error!("[Session] Failed to persist voice settings");
-                            let _ = tx.rollback().await;
+                            log::error!("[Session] Failed to start transaction for voice settings");
                         }
-                    } else {
-                        log::error!("[Session] Failed to start transaction for voice settings");
+
+                        // Complete FC
+                        replies.push(protocol.function_call_output_msg(
+                            &call_id,
+                            &name,
+                            "{\"status\":\"switching\"}",
+                        ));
+
+                        return (replies, Some(LoopExit::Reconnect(voice_name)));
                     }
 
-                    // Complete FC
-                    replies.push(protocol.function_call_output_msg(
-                        &call_id,
-                        &name,
-                        "{\"status\":\"switching\"}",
-                    ));
-
-                    return (replies, Some(LoopExit::Reconnect(voice_name)));
-                }
-
-                // Subagent tools — handled immediately (bypass task_manager)
-                if name == "spawn_subagent" {
-                    let args: Value =
-                        serde_json::from_str(&effective_arguments).unwrap_or(serde_json::json!({}));
-                    let goal = args["goal"].as_str().unwrap_or("").to_string();
-                    let result = match subagent_mgr.spawn(&goal).await {
-                        Ok(task_id) => {
-                            log::info!("[Session] Spawned subagent {} for: {}", task_id, goal);
-                            serde_json::json!({
+                    // Subagent tools — handled immediately (bypass task_manager)
+                    if name == "spawn_subagent" {
+                        let args: Value = serde_json::from_str(&effective_arguments)
+                            .unwrap_or(serde_json::json!({}));
+                        let goal = args["goal"].as_str().unwrap_or("").to_string();
+                        let result = match subagent_mgr.spawn(&goal).await {
+                            Ok(task_id) => {
+                                log::info!("[Session] Spawned subagent {} for: {}", task_id, goal);
+                                serde_json::json!({
                                 "task_id": task_id, 
                                 "status": "spawned", 
                                 "sys_instruction": "Task started in background. CRITICAL: You MUST now immediately speak a brief natural filler like 'Let me check on that' or '我现在去看看' to let the user know you are working on it. Keep your internal mechanics strictly hidden."
                             }).to_string()
-                        }
-                        Err(e) => {
-                            log::error!("[Session] Failed to spawn subagent: {}", e);
-                            serde_json::json!({"error": e}).to_string()
-                        }
-                    };
-                    replies.push(protocol.function_call_output_msg(&call_id, &name, &result));
-                } else if name == "reply_to_subagent" {
-                    let args: Value =
-                        serde_json::from_str(&effective_arguments).unwrap_or(serde_json::json!({}));
-                    let task_id = args["task_id"].as_str().unwrap_or("").to_string();
-                    let message = args["message"].as_str().unwrap_or("").to_string();
-                    let result = match subagent_mgr.reply(&task_id, &message) {
-                        Ok(()) => {
-                            log::info!("[Session] Delivered reply to subagent {}", task_id);
-                            serde_json::json!({"status": "delivered", "task_id": task_id})
-                                .to_string()
-                        }
-                        Err(e) => serde_json::json!({"error": e}).to_string(),
-                    };
-                    replies.push(protocol.function_call_output_msg(&call_id, &name, &result));
-                } else if self.consecutive_tool_rounds >= MAX_TOOL_ROUNDS {
-                    // Safety: reject tool calls if we've exceeded max consecutive rounds
-                    log::warn!(
-                        "[Session] Rejecting tool call {} — max rounds ({}) reached",
-                        name,
-                        MAX_TOOL_ROUNDS
-                    );
-                    replies.push(protocol.function_call_output_msg(
+                            }
+                            Err(e) => {
+                                log::error!("[Session] Failed to spawn subagent: {}", e);
+                                serde_json::json!({"error": e}).to_string()
+                            }
+                        };
+                        replies.push(protocol.function_call_output_msg(&call_id, &name, &result));
+                    } else if name == "reply_to_subagent" {
+                        let args: Value = serde_json::from_str(&effective_arguments)
+                            .unwrap_or(serde_json::json!({}));
+                        let task_id = args["task_id"].as_str().unwrap_or("").to_string();
+                        let message = args["message"].as_str().unwrap_or("").to_string();
+                        let result = match subagent_mgr.reply(&task_id, &message) {
+                            Ok(()) => {
+                                log::info!("[Session] Delivered reply to subagent {}", task_id);
+                                serde_json::json!({"status": "delivered", "task_id": task_id})
+                                    .to_string()
+                            }
+                            Err(e) => serde_json::json!({"error": e}).to_string(),
+                        };
+                        replies.push(protocol.function_call_output_msg(&call_id, &name, &result));
+                    } else if self.consecutive_tool_rounds >= MAX_TOOL_ROUNDS {
+                        // Safety: reject tool calls if we've exceeded max consecutive rounds
+                        log::warn!(
+                            "[Session] Rejecting tool call {} — max rounds ({}) reached",
+                            name,
+                            MAX_TOOL_ROUNDS
+                        );
+                        replies.push(protocol.function_call_output_msg(
                     &call_id, &name, "{\"error\": \"Maximum tool execution rounds reached. Please summarize your progress and tell the user.\"}"
                 ));
-                } else {
-                    // Root fix: time/evidence checks should default to "before now"
-                    // to avoid using current-turn utterances as evidence.
-                    if name == "query_memory_evidence" || name == "get_last_chat_time" {
-                        if let Ok(mut args) = serde_json::from_str::<Value>(&effective_arguments) {
-                            let now_ts = chrono::Utc::now().timestamp();
-                            let cutoff = self.user_turn_started_at.unwrap_or(now_ts);
-                            let min_allowed = now_ts - MAX_MEMORY_TOOL_LOOKBACK_SECONDS;
+                    } else {
+                        // Root fix: time/evidence checks should default to "before now"
+                        // to avoid using current-turn utterances as evidence.
+                        if name == "query_memory_evidence" || name == "get_last_chat_time" {
+                            if let Ok(mut args) =
+                                serde_json::from_str::<Value>(&effective_arguments)
+                            {
+                                let now_ts = chrono::Utc::now().timestamp();
+                                let cutoff = self.user_turn_started_at.unwrap_or(now_ts);
+                                let min_allowed = now_ts - MAX_MEMORY_TOOL_LOOKBACK_SECONDS;
 
-                            let sanitized_before = args
-                                .get("before_unix_ts")
-                                .and_then(|v| v.as_i64())
-                                .filter(|ts| *ts >= min_allowed && *ts <= now_ts + 60)
-                                .unwrap_or(cutoff);
-                            args["before_unix_ts"] = serde_json::json!(sanitized_before);
+                                let sanitized_before = args
+                                    .get("before_unix_ts")
+                                    .and_then(|v| v.as_i64())
+                                    .filter(|ts| *ts >= min_allowed && *ts <= now_ts + 60)
+                                    .unwrap_or(cutoff);
+                                args["before_unix_ts"] = serde_json::json!(sanitized_before);
 
-                            if args.get("exclude_recent_seconds").is_none() {
-                                args["exclude_recent_seconds"] =
-                                    serde_json::json!(DEFAULT_MEMORY_TOOL_EXCLUDE_RECENT_SECONDS);
+                                if args.get("exclude_recent_seconds").is_none() {
+                                    args["exclude_recent_seconds"] = serde_json::json!(
+                                        DEFAULT_MEMORY_TOOL_EXCLUDE_RECENT_SECONDS
+                                    );
+                                }
+                                effective_arguments = args.to_string();
                             }
-                            effective_arguments = args.to_string();
+                        }
+
+                        // All other tools: accumulate for batch submission
+                        log::info!(
+                            "[Session] Tool call: {} (args_bytes={})",
+                            name,
+                            effective_arguments.len()
+                        );
+                        log::debug!("[Session] Tool args {}: {}", name, effective_arguments);
+                        self.pending_tool_calls.push(task_manager::TaskRequest {
+                            call_id,
+                            tool_name: name,
+                            arguments: effective_arguments,
+                        });
+                    }
+                }
+                realtime_ws::WsEvent::ResponseDone => {
+                    if self.response_done_handled_for_turn {
+                        log::debug!("[Session] Ignoring duplicated ResponseDone in same turn");
+                        continue;
+                    }
+                    self.response_done_handled_for_turn = true;
+                    log::info!("[Session] Response completed");
+                    // Fallback flush for providers/events that may not emit ResponseStart.
+                    self.flush_user_transcript(memory).await;
+                    // Clear AI speaking flag — playback buffer + echo tail handle the remaining audio
+                    flags.is_ai_speaking.store(false, Ordering::Relaxed);
+                    // Persist accumulated transcript to memory
+                    if !self.transcript_buf.is_empty() {
+                        let full_text = std::mem::take(&mut self.transcript_buf);
+                        if let Err(e) = memory.persist("assistant", &full_text).await {
+                            log::error!("[Session] Failed to persist output: {}", e);
                         }
                     }
+                    // Submit any pending tool calls as a batch
+                    if !self.pending_tool_calls.is_empty() {
+                        let calls: Vec<task_manager::TaskRequest> =
+                            std::mem::take(&mut self.pending_tool_calls);
+                        self.tools_in_flight += calls.len();
+                        log::info!("[Session] Submitting {} tool calls", self.tools_in_flight);
+                        task_mgr.submit(calls);
+                    }
+                }
+                realtime_ws::WsEvent::Error(msg) => {
+                    log::error!("[Session] Server error: {}", msg);
+                    if let Err(e) = app.emit(
+                        "agent-status",
+                        StatusPayload {
+                            state: "error".into(),
+                            message: Some(msg),
+                        },
+                    ) {
+                        log::warn!("[Session] Emit event error: {}", e);
+                    }
+                }
+                realtime_ws::WsEvent::UserSpeechStarted => {
+                    let duration = flags.speech_duration_ms.load(Ordering::Relaxed);
+                    let peak = f32::from_bits(flags.peak_rms.load(Ordering::Relaxed));
 
-                    // All other tools: accumulate for batch submission
                     log::info!(
-                        "[Session] Tool call: {} (args_bytes={})",
-                        name,
-                        effective_arguments.len()
-                    );
-                    log::debug!("[Session] Tool args {}: {}", name, effective_arguments);
-                    self.pending_tool_calls.push(task_manager::TaskRequest {
-                        call_id,
-                        tool_name: name,
-                        arguments: effective_arguments,
-                    });
-                }
-            }
-            realtime_ws::WsEvent::ResponseDone => {
-                if self.response_done_handled_for_turn {
-                    log::debug!("[Session] Ignoring duplicated ResponseDone in same turn");
-                    continue;
-                }
-                self.response_done_handled_for_turn = true;
-                log::info!("[Session] Response completed");
-                // Fallback flush for providers/events that may not emit ResponseStart.
-                self.flush_user_transcript(memory).await;
-                // Clear AI speaking flag — playback buffer + echo tail handle the remaining audio
-                flags.is_ai_speaking.store(false, Ordering::Relaxed);
-                // Persist accumulated transcript to memory
-                if !self.transcript_buf.is_empty() {
-                    let full_text = std::mem::take(&mut self.transcript_buf);
-                    if let Err(e) = memory.persist("assistant", &full_text).await { log::error!("[Session] Failed to persist output: {}", e); }
-                }
-                // Submit any pending tool calls as a batch
-                if !self.pending_tool_calls.is_empty() {
-                    let calls: Vec<task_manager::TaskRequest> = std::mem::take(&mut self.pending_tool_calls);
-                    self.tools_in_flight += calls.len();
-                    log::info!("[Session] Submitting {} tool calls", self.tools_in_flight);
-                    task_mgr.submit(calls);
-                }
-            }
-            realtime_ws::WsEvent::Error(msg) => {
-                log::error!("[Session] Server error: {}", msg);
-                if let Err(e) = app.emit(
-                    "agent-status",
-                    StatusPayload {
-                        state: "error".into(),
-                        message: Some(msg),
-                    },
-                ) {
-                    log::warn!("[Session] Emit event error: {}", e);
-                }
-            }
-            realtime_ws::WsEvent::UserSpeechStarted => {
-                let duration = flags.speech_duration_ms.load(Ordering::Relaxed);
-                let peak = f32::from_bits(flags.peak_rms.load(Ordering::Relaxed));
-                
-                log::info!(
                     "[Session] User speech started detected. Local metrics: duration={}ms, peak_rms={:.3}",
                     duration, peak
                 );
 
-                if duration < 500 && peak < 0.08 {
-                    // Soft interruption / Backchannel
-                    log::info!("[Session] Soft interruption detected (backchannel). Not interrupting AI.");
-                } else {
-                    // Hard interruption -> full abort
-                    log::info!("[Session] Hard interruption. Stopping playback and aborting tasks.");
-                    flags.is_ai_speaking.store(false, Ordering::Relaxed);
-                    let _ = playback_tx.try_send(PlaybackCommand::FadeOut(100));
-                    if self.tools_in_flight > 0 {
+                    if duration < 500 && peak < 0.08 {
+                        // Soft interruption / Backchannel
+                        log::info!("[Session] Soft interruption detected (backchannel). Not interrupting AI.");
+                    } else {
+                        // Hard interruption -> full abort
                         log::info!(
-                            "[Session] Aborting {} running tools due to interrupt",
-                            self.tools_in_flight
+                            "[Session] Hard interruption. Stopping playback and aborting tasks."
                         );
-                        task_mgr.abort_all();
-                        self.tools_in_flight = 0;
-                    }
-                    if !self.transcript_buf.is_empty() {
-                        let partial = self.transcript_buf.clone();
-                        let sys_msg = format!(
+                        flags.is_ai_speaking.store(false, Ordering::Relaxed);
+                        let _ = playback_tx.try_send(PlaybackCommand::FadeOut(100));
+                        if self.tools_in_flight > 0 {
+                            log::info!(
+                                "[Session] Aborting {} running tools due to interrupt",
+                                self.tools_in_flight
+                            );
+                            task_mgr.abort_all();
+                            self.tools_in_flight = 0;
+                        }
+                        if !self.transcript_buf.is_empty() {
+                            let partial = self.transcript_buf.clone();
+                            let sys_msg = format!(
                             "SYSTEM: The user just interrupted you. Your last partial sentence was '{}'. Please listen to what they say next and respond naturally.",
                             partial
                         );
-                        let inject_msg = protocol.inject_system_directive(&sys_msg);
-                        replies.push(inject_msg);
-                        // Clear the buffer since it was interrupted
-                        self.transcript_buf.clear();
+                            let inject_msg = protocol.inject_system_directive(&sys_msg);
+                            replies.push(inject_msg);
+                            // Clear the buffer since it was interrupted
+                            self.transcript_buf.clear();
+                        }
                     }
                 }
-            }
-            realtime_ws::WsEvent::Other(event_type) => {
-                let preview: String = raw.chars().take(300).collect();
-                log::debug!("[Session] WS event '{}': {}", event_type, preview);
+                realtime_ws::WsEvent::Other(event_type) => {
+                    let preview: String = raw.chars().take(300).collect();
+                    log::debug!("[Session] WS event '{}': {}", event_type, preview);
+                }
             }
         }
-    }
-    (replies, None)
+        (replies, None)
     }
 }
 

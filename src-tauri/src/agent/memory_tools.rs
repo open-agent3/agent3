@@ -93,10 +93,7 @@ use chrono::TimeZone;
 
 /// Handle `get_last_chat_time` tool call
 pub async fn handle_get_last_chat_time(app: &AppHandle, args: &serde_json::Value) -> String {
-    let speaker_scope = args["speaker_scope"]
-        .as_str()
-        .unwrap_or("both")
-        .to_string();
+    let speaker_scope = args["speaker_scope"].as_str().unwrap_or("both").to_string();
     if speaker_scope != "both" && speaker_scope != "user_only" && speaker_scope != "assistant_only"
     {
         return "Error: speaker_scope must be 'both', 'user_only', or 'assistant_only'".to_string();
@@ -226,10 +223,7 @@ pub async fn handle_get_last_chat_time(app: &AppHandle, args: &serde_json::Value
 }
 
 /// Handle `query_memory_evidence` tool call
-pub async fn handle_query_memory_evidence(
-    app: &AppHandle,
-    args: &serde_json::Value,
-) -> String {
+pub async fn handle_query_memory_evidence(app: &AppHandle, args: &serde_json::Value) -> String {
     let query = args["query"].as_str().unwrap_or("").trim().to_string();
     if query.is_empty() {
         return "Error: query is empty".to_string();
@@ -240,10 +234,7 @@ pub async fn handle_query_memory_evidence(
         return "Error: mode must be 'exact' or 'semantic'".to_string();
     }
 
-    let speaker_scope = args["speaker_scope"]
-        .as_str()
-        .unwrap_or("both")
-        .to_string();
+    let speaker_scope = args["speaker_scope"].as_str().unwrap_or("both").to_string();
     if speaker_scope != "both" && speaker_scope != "user_only" && speaker_scope != "assistant_only"
     {
         return "Error: speaker_scope must be 'both', 'user_only', or 'assistant_only'".to_string();

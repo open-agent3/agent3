@@ -66,7 +66,9 @@ fn pcm_to_wav(samples: &[i16], sample_rate: u32) -> Result<Vec<u8>, String> {
 
 /// Start recording wakeword samples (notify audio module to start buffering)
 #[tauri::command]
-pub async fn wakeword_start_record(state: tauri::State<'_, super::AgentState>) -> Result<(), String> {
+pub async fn wakeword_start_record(
+    state: tauri::State<'_, super::AgentState>,
+) -> Result<(), String> {
     let guard = state.audio.lock().await;
     let handle = guard
         .as_ref()
@@ -78,7 +80,9 @@ pub async fn wakeword_start_record(state: tauri::State<'_, super::AgentState>) -
 
 /// Stop recording and return recording duration (seconds)
 #[tauri::command]
-pub async fn wakeword_stop_record(state: tauri::State<'_, super::AgentState>) -> Result<f32, String> {
+pub async fn wakeword_stop_record(
+    state: tauri::State<'_, super::AgentState>,
+) -> Result<f32, String> {
     let guard = state.audio.lock().await;
     let handle = guard
         .as_ref()

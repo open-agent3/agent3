@@ -84,7 +84,11 @@ pub struct TaskManager {
 }
 
 impl TaskManager {
-    pub fn new(app: AppHandle, event_tx: mpsc::Sender<TaskEvent>, inject_tx: mpsc::Sender<String>) -> Self {
+    pub fn new(
+        app: AppHandle,
+        event_tx: mpsc::Sender<TaskEvent>,
+        inject_tx: mpsc::Sender<String>,
+    ) -> Self {
         Self {
             app,
             event_tx,
@@ -104,7 +108,13 @@ impl TaskManager {
     /// Abort a specific task
     #[allow(dead_code)]
     pub fn abort(&self, call_id: &str) {
-        let mut running = self.running.lock() /* removed unwrap_or_else */ .unwrap_or_else(|e| { log::error!("[Mutex] Poisoned, state corrupted. Propagating panic."); panic!("Mutex poisoned: {}", e); });
+        let mut running = self
+            .running
+            .lock() /* removed unwrap_or_else */
+            .unwrap_or_else(|e| {
+                log::error!("[Mutex] Poisoned, state corrupted. Propagating panic.");
+                panic!("Mutex poisoned: {}", e);
+            });
         if let Some(task) = running.remove(call_id) {
             if let Some(child) = task.child {
                 kill_child_process(&child, call_id);
@@ -118,7 +128,13 @@ impl TaskManager {
 
     /// Abort all tasks
     pub fn abort_all(&self) {
-        let mut running = self.running.lock() /* removed unwrap_or_else */ .unwrap_or_else(|e| { log::error!("[Mutex] Poisoned, state corrupted. Propagating panic."); panic!("Mutex poisoned: {}", e); });
+        let mut running = self
+            .running
+            .lock() /* removed unwrap_or_else */
+            .unwrap_or_else(|e| {
+                log::error!("[Mutex] Poisoned, state corrupted. Propagating panic.");
+                panic!("Mutex poisoned: {}", e);
+            });
         for (id, task) in running.drain() {
             if let Some(child) = task.child {
                 kill_child_process(&child, &id);
@@ -136,12 +152,15 @@ impl TaskManager {
         let arguments = task.arguments.clone();
         let event_tx = self.event_tx.clone();
         let app = self.app.clone();
-        
-        let is_background = if let Ok(serde_json::Value::Object(map)) = serde_json::from_str(&arguments) {
-            map.get("run_in_background").and_then(|v| v.as_bool()).unwrap_or(false)
-        } else {
-            false
-        };
+
+        let is_background =
+            if let Ok(serde_json::Value::Object(map)) = serde_json::from_str(&arguments) {
+                map.get("run_in_background")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+            } else {
+                false
+            };
 
         let shell_child = if tool_name == "exec_shell" {
             Some(Arc::new(Mutex::new(None)))
@@ -153,7 +172,7 @@ impl TaskManager {
         let inner_call_id = call_id.clone();
         let inner_tool_name = tool_name.clone();
         let inner_metrics = self.metrics.clone();
-        
+
         let worker_join = tokio::spawn(async move {
             let output = if tools::is_ui_tool(&inner_tool_name) {
                 tools::dispatch_ui_tool(&app, &inner_tool_name, &arguments).await
@@ -164,7 +183,7 @@ impl TaskManager {
                 let child = shell_child_for_task.unwrap_or_else(|| Arc::new(Mutex::new(None)));
                 let result = exec_shell_streaming(&args_clone, &cid, &tx, &child).await;
                 if result.timed_out {
-                     inner_metrics.timed_out.fetch_add(1, Ordering::Relaxed);
+                    inner_metrics.timed_out.fetch_add(1, Ordering::Relaxed);
                 }
                 result.output
             } else {
@@ -174,7 +193,8 @@ impl TaskManager {
                 match tokio::task::spawn_blocking(move || {
                     tools::dispatch_tool_with_app(&app_clone, &name_clone, &args_clone)
                 })
-                .await {
+                .await
+                {
                     Ok(res) => res,
                     Err(e) => {
                         log::error!("[TaskManager] Blocking tool execution panicked: {}", e);
@@ -192,7 +212,7 @@ impl TaskManager {
                 output: "Task started in background. Please say something like 'I have started the process.' and wait.".to_string(),
             };
             let _ = self.event_tx.try_send(TaskEvent::Completed(instant_result));
-            
+
             let bg_tool = tool_name.clone();
             let bg_inject = self.inject_tx.clone();
             tokio::spawn(async move {
@@ -208,9 +228,12 @@ impl TaskManager {
 
         let call_id_key = call_id.clone();
         let abort_handle = worker_join.abort_handle();
-        
+
         {
-            let mut r = self.running.lock().unwrap_or_else(|e| { log::error!("[Mutex] Poisoned, state corrupted. Propagating panic."); panic!("Mutex poisoned: {}", e); });
+            let mut r = self.running.lock().unwrap_or_else(|e| {
+                log::error!("[Mutex] Poisoned, state corrupted. Propagating panic.");
+                panic!("Mutex poisoned: {}", e);
+            });
             r.insert(
                 call_id_key,
                 RunningTask {
@@ -219,7 +242,7 @@ impl TaskManager {
                 },
             );
         }
-        
+
         self.metrics.started.fetch_add(1, Ordering::Relaxed);
         self.log_metrics_snapshot();
 
@@ -228,7 +251,7 @@ impl TaskManager {
         let final_call_id = call_id.clone();
         let final_tool = tool_name.clone();
         let final_metrics = self.metrics.clone();
-        
+
         tokio::spawn(async move {
             let final_output = match worker_join.await {
                 Ok(output) => output,
@@ -243,20 +266,23 @@ impl TaskManager {
                     }
                 }
             };
-            
+
             // Remove from running map
             {
-                let mut r = final_running.lock().unwrap_or_else(|e| { log::error!("[Mutex] Poisoned, state corrupted. Propagating panic."); panic!("Mutex poisoned: {}", e); });
+                let mut r = final_running.lock().unwrap_or_else(|e| {
+                    log::error!("[Mutex] Poisoned, state corrupted. Propagating panic.");
+                    panic!("Mutex poisoned: {}", e);
+                });
                 r.remove(&final_call_id);
             }
-            
+
             let result = TaskResult {
                 call_id: final_call_id,
                 tool_name: final_tool,
                 output: final_output,
             };
             let _ = final_tx.send(TaskEvent::Completed(result)).await;
-            
+
             final_metrics.completed.fetch_add(1, Ordering::Relaxed);
             log::info!(
                 "[TaskManager] Metrics started={} completed={} aborted={} timed_out={}",
@@ -284,7 +310,12 @@ impl TaskManager {
 }
 
 fn kill_child_process(child_ref: &Arc<Mutex<Option<Child>>>, call_id: &str) {
-    let mut guard = child_ref.lock() /* removed unwrap_or_else */ .unwrap_or_else(|e| { log::error!("[Mutex] Poisoned, state corrupted. Propagating panic."); panic!("Mutex poisoned: {}", e); });
+    let mut guard = child_ref
+        .lock() /* removed unwrap_or_else */
+        .unwrap_or_else(|e| {
+            log::error!("[Mutex] Poisoned, state corrupted. Propagating panic.");
+            panic!("Mutex poisoned: {}", e);
+        });
     if let Some(child) = guard.as_mut() {
         if let Err(e) = child.start_kill() {
             log::warn!(
@@ -387,7 +418,12 @@ async fn exec_shell_streaming_with_timeout(
     let stderr = child.stderr.take();
 
     {
-        let mut slot = child_ref.lock() /* removed unwrap_or_else */ .unwrap_or_else(|e| { log::error!("[Mutex] Poisoned, state corrupted. Propagating panic."); panic!("Mutex poisoned: {}", e); });
+        let mut slot = child_ref
+            .lock() /* removed unwrap_or_else */
+            .unwrap_or_else(|e| {
+                log::error!("[Mutex] Poisoned, state corrupted. Propagating panic.");
+                panic!("Mutex poisoned: {}", e);
+            });
         *slot = Some(child);
     }
 
@@ -457,7 +493,12 @@ async fn exec_shell_streaming_with_timeout(
 
         loop {
             {
-                let mut guard = child_ref.lock() /* removed unwrap_or_else */ .unwrap_or_else(|e| { log::error!("[Mutex] Poisoned, state corrupted. Propagating panic."); panic!("Mutex poisoned: {}", e); });
+                let mut guard = child_ref
+                    .lock() /* removed unwrap_or_else */
+                    .unwrap_or_else(|e| {
+                        log::error!("[Mutex] Poisoned, state corrupted. Propagating panic.");
+                        panic!("Mutex poisoned: {}", e);
+                    });
                 if let Some(child) = guard.as_mut() {
                     match child.try_wait() {
                         Ok(Some(status)) => return Ok(status),
@@ -475,7 +516,12 @@ async fn exec_shell_streaming_with_timeout(
     let exit_status = tokio::time::timeout(timeout, run_loop).await;
 
     {
-        let mut guard = child_ref.lock() /* removed unwrap_or_else */ .unwrap_or_else(|e| { log::error!("[Mutex] Poisoned, state corrupted. Propagating panic."); panic!("Mutex poisoned: {}", e); });
+        let mut guard = child_ref
+            .lock() /* removed unwrap_or_else */
+            .unwrap_or_else(|e| {
+                log::error!("[Mutex] Poisoned, state corrupted. Propagating panic.");
+                panic!("Mutex poisoned: {}", e);
+            });
         *guard = None;
     }
 

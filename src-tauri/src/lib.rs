@@ -139,9 +139,8 @@ pub fn run() {
         .setup(|app| {
             // Initialize SQLite database
             let app_handle = app.handle().clone();
-            let pool = tauri::async_runtime::block_on(db::init_db(&app_handle)).map_err(|e| {
-                tauri::Error::Io(std::io::Error::other(e.to_string()))
-            })?;
+            let pool = tauri::async_runtime::block_on(db::init_db(&app_handle))
+                .map_err(|e| tauri::Error::Io(std::io::Error::other(e.to_string())))?;
             app.manage(db::DbState(pool));
 
             // Detect and set locale

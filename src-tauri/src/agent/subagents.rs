@@ -174,60 +174,60 @@ async fn resolve_provider(app: &AppHandle) -> Result<ChatProvider, String> {
     let db_state = app.state::<DbState>();
     let pool = &db_state.0;
 
-        let columns =
-            sqlx::query_scalar::<_, String>("SELECT name FROM pragma_table_info('llm_providers')")
-                .fetch_all(pool)
-                .await
-                .map_err(|e| e.to_string())?;
+    let columns =
+        sqlx::query_scalar::<_, String>("SELECT name FROM pragma_table_info('llm_providers')")
+            .fetch_all(pool)
+            .await
+            .map_err(|e| e.to_string())?;
 
-        let has_role_column = columns.iter().any(|name| name == "role");
+    let has_role_column = columns.iter().any(|name| name == "role");
 
-        if !has_role_column {
-            log::warn!(
-                "[Subagent] llm_providers.role is missing, falling back to active realtime provider"
-            );
-        }
+    if !has_role_column {
+        log::warn!(
+            "[Subagent] llm_providers.role is missing, falling back to active realtime provider"
+        );
+    }
 
-        // Try dedicated background provider first, fall back to active realtime provider
-        let background_row: Option<(String, String, String, String, String)> = if has_role_column {
-            sqlx::query_as(
-                "SELECT id, base_url, api_key, model, provider_type FROM llm_providers \
+    // Try dedicated background provider first, fall back to active realtime provider
+    let background_row: Option<(String, String, String, String, String)> = if has_role_column {
+        sqlx::query_as(
+            "SELECT id, base_url, api_key, model, provider_type FROM llm_providers \
                  WHERE role = 'background' AND is_active = 1 LIMIT 1",
-            )
+        )
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+    } else {
+        None
+    };
+
+    if background_row.is_none() {
+        log::warn!(
+                "[Subagent] No active background provider found, falling back to active realtime provider"
+            );
+    }
+
+    let fallback_query = if has_role_column {
+        "SELECT id, base_url, api_key, model, provider_type FROM llm_providers \
+                 WHERE is_active = 1 AND role IN ('realtime', 'sensory') LIMIT 1"
+    } else {
+        "SELECT id, base_url, api_key, model, provider_type FROM llm_providers \
+                 WHERE is_active = 1 LIMIT 1"
+    };
+
+    let row = match background_row {
+        Some(row) => row,
+        None => sqlx::query_as(fallback_query)
             .fetch_optional(pool)
             .await
             .ok()
             .flatten()
-        } else {
-            None
-        };
+            .ok_or_else(|| "No LLM provider available for subagent".to_string())?,
+    };
 
-        if background_row.is_none() {
-            log::warn!(
-                "[Subagent] No active background provider found, falling back to active realtime provider"
-            );
-        }
-
-        let fallback_query = if has_role_column {
-            "SELECT id, base_url, api_key, model, provider_type FROM llm_providers \
-                 WHERE is_active = 1 AND role IN ('realtime', 'sensory') LIMIT 1"
-        } else {
-            "SELECT id, base_url, api_key, model, provider_type FROM llm_providers \
-                 WHERE is_active = 1 LIMIT 1"
-        };
-
-        let row = match background_row {
-            Some(row) => row,
-            None => sqlx::query_as(fallback_query)
-                .fetch_optional(pool)
-                .await
-                .ok()
-                .flatten()
-                .ok_or_else(|| "No LLM provider available for subagent".to_string())?,
-        };
-
-        let (id, base_url, raw_api_key, model, provider_type) = row;
-        let api_key = crate::keystore::resolve_api_key(&id, &raw_api_key);
+    let (id, base_url, raw_api_key, model, provider_type) = row;
+    let api_key = crate::keystore::resolve_api_key(&id, &raw_api_key);
 
     Ok(ChatProvider {
         api_key,
@@ -431,20 +431,18 @@ async fn subagent_loop(
         if let Some(content) = message["content"].as_str() {
             if !content.trim().is_empty() {
                 let mut display_text = content.to_string();
-                if let (Some(start), Some(end)) = (display_text.find("<thinking>"), display_text.find("</thinking>")) {
+                if let (Some(start), Some(end)) = (
+                    display_text.find("<thinking>"),
+                    display_text.find("</thinking>"),
+                ) {
                     if end > start + 10 {
-                        display_text = display_text[start+10..end].to_string();
+                        display_text = display_text[start + 10..end].to_string();
                     }
                 }
                 // Clean up newlines for the ghost UI log
                 display_text = display_text.replace('\n', " ").trim().to_string();
                 if !display_text.is_empty() {
-                    emit_log(
-                        &app,
-                        &task_id,
-                        "thinking",
-                        &display_text,
-                    );
+                    emit_log(&app, &task_id, "thinking", &display_text);
                 }
             }
         }
@@ -594,7 +592,10 @@ fn cleanup(tasks: &Arc<Mutex<HashMap<String, AbortHandle>>>, task_id: &str) {
 
 impl Drop for SubagentManager {
     fn drop(&mut self) {
-        let mut tasks = self.tasks.lock().unwrap_or_else(|e| { log::error!("[Mutex] Poisoned, state corrupted. Propagating panic."); panic!("Mutex poisoned: {}", e); });
+        let mut tasks = self.tasks.lock().unwrap_or_else(|e| {
+            log::error!("[Mutex] Poisoned, state corrupted. Propagating panic.");
+            panic!("Mutex poisoned: {}", e);
+        });
         for (id, handle) in tasks.drain() {
             handle.abort();
             log::info!("[Subagent] Aborted task {} on Drop", id);

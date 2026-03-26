@@ -124,7 +124,10 @@ impl AudioHandle {
     pub fn start_recording(&self) {
         self.record_buffer
             .lock()
-            .unwrap_or_else(|e| { log::error!("[Mutex] Poisoned, state corrupted. Propagating panic."); panic!("Mutex poisoned: {}", e); })
+            .unwrap_or_else(|e| {
+                log::error!("[Mutex] Poisoned, state corrupted. Propagating panic.");
+                panic!("Mutex poisoned: {}", e);
+            })
             .clear();
         self.recording.store(true, Ordering::Relaxed);
     }
@@ -132,7 +135,10 @@ impl AudioHandle {
     /// Stop recording, return PCM i16 buffer
     pub fn stop_recording(&self) -> Vec<i16> {
         self.recording.store(false, Ordering::Relaxed);
-        let mut buf = self.record_buffer.lock().unwrap_or_else(|e| { log::error!("[Mutex] Poisoned, state corrupted. Propagating panic."); panic!("Mutex poisoned: {}", e); });
+        let mut buf = self.record_buffer.lock().unwrap_or_else(|e| {
+            log::error!("[Mutex] Poisoned, state corrupted. Propagating panic.");
+            panic!("Mutex poisoned: {}", e);
+        });
         std::mem::take(&mut *buf)
     }
 }
@@ -577,7 +583,7 @@ async fn process_loop(
 
         if rms > gate {
             last_speech = std::time::Instant::now();
-            
+
             if current_speech_start.is_none() {
                 current_speech_start = Some(std::time::Instant::now());
                 current_peak_rms = rms;
@@ -587,7 +593,9 @@ async fn process_loop(
                 current_peak_rms = current_peak_rms.max(rms);
                 let duration = current_speech_start.unwrap().elapsed().as_millis() as u64;
                 flags.speech_duration_ms.store(duration, Ordering::Relaxed);
-                flags.peak_rms.store(current_peak_rms.to_bits(), Ordering::Relaxed);
+                flags
+                    .peak_rms
+                    .store(current_peak_rms.to_bits(), Ordering::Relaxed);
             }
         } else if current_speech_start.is_some() {
             // Speech ended

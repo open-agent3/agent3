@@ -158,6 +158,26 @@ pub fn all_tools() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
+            name: "list_running_apps",
+            description: "List currently running processes/applications on the user's OS. Use this to check if a specific program is open.",
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        },
+        ToolDef {
+            name: "search_installed_software",
+            description: "Search for installed software on the user's OS by keyword. Use this to check if an app (e.g. 'Spotify', 'WeChat') is installed before trying to open it.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "keyword": { "type": "string", "description": "Keyword to search for in installed applications, e.g. 'music', 'spotify' or leave empty for all" }
+                },
+                "required": []
+            }),
+        },
+        ToolDef {
             name: "set_agent_config",
             description: "Set a configuration item for the agent. The user may ask you to change your name or other settings. Use key 'agent_name' to set the agent display name.",
             parameters: json!({
@@ -353,6 +373,8 @@ pub fn is_ui_tool(name: &str) -> bool {
             | "open_external"
             | "read_clipboard"
             | "write_clipboard"
+            | "list_running_apps"
+            | "search_installed_software"
             | "set_agent_config"
             | "schedule_task"
             | "disconnect_session"
@@ -371,14 +393,14 @@ pub fn is_ui_tool(name: &str) -> bool {
 
 /// Dispatch UI tool (requires AppHandle to create windows / open external apps)
 pub async fn dispatch_ui_tool(app: &AppHandle, name: &str, args_json: &str) -> String {
-  let args: serde_json::Value = match serde_json::from_str(args_json) {
-    Ok(v) => v,
-    Err(e) => {
-      let msg = format!("Invalid tool args JSON: {}", e);
-      log::error!("[Tools] {}", msg);
-      return format!("Error: {}", msg);
-    }
-  };
+    let args: serde_json::Value = match serde_json::from_str(args_json) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!("Invalid tool args JSON: {}", e);
+            log::error!("[Tools] {}", msg);
+            return format!("Error: {}", msg);
+        }
+    };
     log::info!("[Tools] UI dispatch: {}({})", name, args_json);
 
     match name {
@@ -450,6 +472,23 @@ pub async fn dispatch_ui_tool(app: &AppHandle, name: &str, args_json: &str) -> S
                 Err(e) => format!("Error writing clipboard: {}", e),
             }
         }
+        "list_running_apps" => match crate::system_api::list_running_apps() {
+            Ok(apps) => format!("Running processes: {}", apps.join(", ")),
+            Err(e) => format!("Error listing running apps: {}", e),
+        },
+        "search_installed_software" => {
+            let keyword = args["keyword"].as_str().map(|s| s.to_string());
+            match crate::system_api::search_installed_software(keyword) {
+                Ok(apps) => {
+                    if apps.is_empty() {
+                        "No matching installed software found.".to_string()
+                    } else {
+                        format!("Installed software found: {}", apps.join(", "))
+                    }
+                }
+                Err(e) => format!("Error searching installed software: {}", e),
+            }
+        }
         "set_agent_config" => {
             let key = args["key"].as_str().unwrap_or("");
             let value = args["value"].as_str().unwrap_or("");
@@ -458,7 +497,7 @@ pub async fn dispatch_ui_tool(app: &AppHandle, name: &str, args_json: &str) -> S
             }
             let db_state = app.state::<DbState>();
             let pool = &db_state.0;
-          match sqlx::query(
+            match sqlx::query(
             "INSERT INTO app_settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
           )
           .bind(key)
@@ -481,11 +520,11 @@ pub async fn dispatch_ui_tool(app: &AppHandle, name: &str, args_json: &str) -> S
             let db_state = app.state::<DbState>();
             let pool = &db_state.0;
             match crate::db::upsert_core_profile(pool, key, value).await {
-              Ok(_) => {
-                log::info!("[Tools] Core profile updated: {} = {}", key, value);
-                format!("OK: Core profile {} = {}", key, value)
-              }
-              Err(e) => format!("Error updating core profile: {}", e),
+                Ok(_) => {
+                    log::info!("[Tools] Core profile updated: {} = {}", key, value);
+                    format!("OK: Core profile {} = {}", key, value)
+                }
+                Err(e) => format!("Error updating core profile: {}", e),
             }
         }
         "add_knowledge_node" => {
@@ -498,11 +537,11 @@ pub async fn dispatch_ui_tool(app: &AppHandle, name: &str, args_json: &str) -> S
             let db_state = app.state::<DbState>();
             let pool = &db_state.0;
             match crate::db::add_kg_node(pool, id, label, node_type).await {
-              Ok(_) => {
-                log::info!("[Tools] KG node added: {}", id);
-                format!("OK: Added knowledge node '{}'", id)
-              }
-              Err(e) => format!("Error adding knowledge node: {}", e),
+                Ok(_) => {
+                    log::info!("[Tools] KG node added: {}", id);
+                    format!("OK: Added knowledge node '{}'", id)
+                }
+                Err(e) => format!("Error adding knowledge node: {}", e),
             }
         }
         "add_knowledge_edge" => {
@@ -515,16 +554,16 @@ pub async fn dispatch_ui_tool(app: &AppHandle, name: &str, args_json: &str) -> S
             let db_state = app.state::<DbState>();
             let pool = &db_state.0;
             match crate::db::add_kg_edge(pool, source, target, relation).await {
-              Ok(_) => {
-                log::info!(
-                  "[Tools] KG edge added: {} -[{}]-> {}",
-                  source,
-                  relation,
-                  target
-                );
-                format!("OK: Added edge {} -[{}]-> {}", source, relation, target)
-              }
-              Err(e) => format!("Error adding knowledge edge: {}", e),
+                Ok(_) => {
+                    log::info!(
+                        "[Tools] KG edge added: {} -[{}]-> {}",
+                        source,
+                        relation,
+                        target
+                    );
+                    format!("OK: Added edge {} -[{}]-> {}", source, relation, target)
+                }
+                Err(e) => format!("Error adding knowledge edge: {}", e),
             }
         }
         "schedule_task" => {
@@ -561,33 +600,31 @@ pub async fn dispatch_ui_tool(app: &AppHandle, name: &str, args_json: &str) -> S
             let db_state = app.state::<DbState>();
             let pool = &db_state.0;
             match crate::db::search_kg_subgraph(pool, keyword, limit).await {
-              Ok((nodes, edges)) => {
-                if nodes.is_empty() {
-                  format!("No knowledge found matching '{}'", keyword)
-                } else {
-                  let mut res = String::new();
-                  res.push_str("Nodes:\n");
-                  for n in nodes {
-                    res.push_str(&format!("  {} ({}): {}\n", n.id, n.r#type, n.label));
-                  }
-                  if !edges.is_empty() {
-                    res.push_str("\nEdges:\n");
-                    for e in edges {
-                      res.push_str(&format!(
-                        "  {} -[{}]-> {}\n",
-                        e.source_id, e.relation, e.target_id
-                      ));
+                Ok((nodes, edges)) => {
+                    if nodes.is_empty() {
+                        format!("No knowledge found matching '{}'", keyword)
+                    } else {
+                        let mut res = String::new();
+                        res.push_str("Nodes:\n");
+                        for n in nodes {
+                            res.push_str(&format!("  {} ({}): {}\n", n.id, n.r#type, n.label));
+                        }
+                        if !edges.is_empty() {
+                            res.push_str("\nEdges:\n");
+                            for e in edges {
+                                res.push_str(&format!(
+                                    "  {} -[{}]-> {}\n",
+                                    e.source_id, e.relation, e.target_id
+                                ));
+                            }
+                        }
+                        res
                     }
-                  }
-                  res
                 }
-              }
-              Err(e) => format!("Error searching knowledge: {}", e),
+                Err(e) => format!("Error searching knowledge: {}", e),
             }
         }
-        "get_last_chat_time" => {
-            super::memory_tools::handle_get_last_chat_time(app, &args).await
-        }
+        "get_last_chat_time" => super::memory_tools::handle_get_last_chat_time(app, &args).await,
         "query_memory_evidence" => {
             super::memory_tools::handle_query_memory_evidence(app, &args).await
         }
@@ -613,7 +650,10 @@ pub async fn dispatch_ui_tool(app: &AppHandle, name: &str, args_json: &str) -> S
             }
         }
         "search_web_duckduckgo" => {
-            let query = args.get("query").and_then(|q| q.as_str()).unwrap_or_default();
+            let query = args
+                .get("query")
+                .and_then(|q| q.as_str())
+                .unwrap_or_default();
             match crate::agent::web_tools::search_web_duckduckgo(query).await {
                 Ok(md) => md,
                 Err(e) => format!("Error: {}", e),
@@ -628,27 +668,27 @@ fn allow_high_risk_shell(app: Option<&AppHandle>) -> bool {
         return false;
     };
 
-  let app_handle = app.clone();
-  let (tx, rx) = std::sync::mpsc::channel::<bool>();
+    let app_handle = app.clone();
+    let (tx, rx) = std::sync::mpsc::channel::<bool>();
 
-  tauri::async_runtime::spawn(async move {
-    let db_state = app_handle.state::<DbState>();
-    let pool = &db_state.0;
-    let setting = sqlx::query_scalar::<_, String>(
-      "SELECT value FROM app_settings WHERE key = 'allow_high_risk_shell'",
-    )
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten()
-    .unwrap_or_else(|| "false".to_string());
+    tauri::async_runtime::spawn(async move {
+        let db_state = app_handle.state::<DbState>();
+        let pool = &db_state.0;
+        let setting = sqlx::query_scalar::<_, String>(
+            "SELECT value FROM app_settings WHERE key = 'allow_high_risk_shell'",
+        )
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "false".to_string());
 
-    let allowed = setting == "true" || setting == "1";
-    let _ = tx.send(allowed);
-  });
+        let allowed = setting == "true" || setting == "1";
+        let _ = tx.send(allowed);
+    });
 
-  rx.recv_timeout(std::time::Duration::from_secs(2))
-    .unwrap_or(false)
+    rx.recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap_or(false)
 }
 
 fn dispatch_tool_inner(app: Option<&AppHandle>, name: &str, args_json: &str) -> String {
@@ -717,75 +757,85 @@ pub fn dispatch_tool_with_app(app: &AppHandle, name: &str, args_json: &str) -> S
 
 #[cfg(test)]
 mod tests {
-  use crate::agent::memory_tools::{format_local_ts, resolve_evidence_cutoff, semantic_overlap_score, split_cjk_chars, tokenize_lower};
-  use super::*;
+    use super::*;
+    use crate::agent::memory_tools::{
+        format_local_ts, resolve_evidence_cutoff, semantic_overlap_score, split_cjk_chars,
+        tokenize_lower,
+    };
 
-  #[test]
-  fn all_tools_json_is_valid() {
-    let tools = all_tools();
-    assert_eq!(tools.len(), 23, "Expected 23 tools");
-    for t in &tools {
-        assert!(!t.name.is_empty(), "Tool name must not be empty");
-        assert!(!t.description.is_empty(), "Tool description must not be empty");
-        assert_eq!(t.parameters["type"], "object", "Parameters must be an object for {}", t.name);
-        // Verify both serialisation formats produce valid JSON
-        let rt = t.to_realtime_json();
-        assert_eq!(rt["type"], "function");
-        assert_eq!(rt["name"], t.name);
-        let chat = t.to_chat_json();
-        assert_eq!(chat["function"]["name"], t.name);
+    #[test]
+    fn all_tools_json_is_valid() {
+        let tools = all_tools();
+        assert_eq!(tools.len(), 25, "Expected 25 tools");
+        for t in &tools {
+            assert!(!t.name.is_empty(), "Tool name must not be empty");
+            assert!(
+                !t.description.is_empty(),
+                "Tool description must not be empty"
+            );
+            assert_eq!(
+                t.parameters["type"], "object",
+                "Parameters must be an object for {}",
+                t.name
+            );
+            // Verify both serialisation formats produce valid JSON
+            let rt = t.to_realtime_json();
+            assert_eq!(rt["type"], "function");
+            assert_eq!(rt["name"], t.name);
+            let chat = t.to_chat_json();
+            assert_eq!(chat["function"]["name"], t.name);
+        }
     }
-  }
 
-  #[test]
-  fn cutoff_prefers_explicit_before_timestamp() {
-    let cutoff = resolve_evidence_cutoff(Some(1234), 30, 9999);
-    assert_eq!(cutoff, 1234);
-  }
+    #[test]
+    fn cutoff_prefers_explicit_before_timestamp() {
+        let cutoff = resolve_evidence_cutoff(Some(1234), 30, 9999);
+        assert_eq!(cutoff, 1234);
+    }
 
-  #[test]
-  fn cutoff_uses_now_minus_exclude_recent_when_before_not_set() {
-    let cutoff = resolve_evidence_cutoff(None, 5, 1000);
-    assert_eq!(cutoff, 995);
-  }
+    #[test]
+    fn cutoff_uses_now_minus_exclude_recent_when_before_not_set() {
+        let cutoff = resolve_evidence_cutoff(None, 5, 1000);
+        assert_eq!(cutoff, 995);
+    }
 
-  #[test]
-  fn cutoff_rejects_too_old_before_timestamp() {
-    let now = 1_800_000_000;
-    let too_old = now - (31 * 24 * 60 * 60);
-    let cutoff = resolve_evidence_cutoff(Some(too_old), 7, now);
-    assert_eq!(cutoff, now - 7);
-  }
+    #[test]
+    fn cutoff_rejects_too_old_before_timestamp() {
+        let now = 1_800_000_000;
+        let too_old = now - (31 * 24 * 60 * 60);
+        let cutoff = resolve_evidence_cutoff(Some(too_old), 7, now);
+        assert_eq!(cutoff, now - 7);
+    }
 
-  #[test]
-  fn cutoff_rejects_future_before_timestamp() {
-    let now = 1_800_000_000;
-    let too_future = now + 300;
-    let cutoff = resolve_evidence_cutoff(Some(too_future), 9, now);
-    assert_eq!(cutoff, now - 9);
-  }
+    #[test]
+    fn cutoff_rejects_future_before_timestamp() {
+        let now = 1_800_000_000;
+        let too_future = now + 300;
+        let cutoff = resolve_evidence_cutoff(Some(too_future), 9, now);
+        assert_eq!(cutoff, now - 9);
+    }
 
-  #[test]
-  fn semantic_overlap_scores_expected_fraction() {
-    let q = tokenize_lower("learn rust memory");
-    let t = tokenize_lower("we learn rust today");
-    let s = semantic_overlap_score(&q, &t);
-    assert!((s - (2.0 / 3.0)).abs() < 0.001);
-  }
+    #[test]
+    fn semantic_overlap_scores_expected_fraction() {
+        let q = tokenize_lower("learn rust memory");
+        let t = tokenize_lower("we learn rust today");
+        let s = semantic_overlap_score(&q, &t);
+        assert!((s - (2.0 / 3.0)).abs() < 0.001);
+    }
 
-  #[test]
-  fn cjk_char_split_supports_semantic_fallback() {
-    let q = split_cjk_chars("上次聊天时间");
-    let t = split_cjk_chars("我们上次聊天是什么时候");
-    let s = semantic_overlap_score(&q, &t);
-    assert!(s > 0.4);
-  }
+    #[test]
+    fn cjk_char_split_supports_semantic_fallback() {
+        let q = split_cjk_chars("上次聊天时间");
+        let t = split_cjk_chars("我们上次聊天是什么时候");
+        let s = semantic_overlap_score(&q, &t);
+        assert!(s > 0.4);
+    }
 
-  #[test]
-  fn format_local_ts_returns_readable_string() {
-    let text = format_local_ts(1_700_000_000);
-    assert!(text.len() >= 16);
-    assert!(text.contains('-'));
-    assert!(text.contains(':'));
-  }
+    #[test]
+    fn format_local_ts_returns_readable_string() {
+        let text = format_local_ts(1_700_000_000);
+        assert!(text.len() >= 16);
+        assert!(text.contains('-'));
+        assert!(text.contains(':'));
+    }
 }

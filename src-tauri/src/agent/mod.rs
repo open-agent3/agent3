@@ -127,20 +127,18 @@ pub async fn start_all(app: AppHandle) -> Result<(), String> {
         let db_state = app.state::<crate::db::DbState>();
         let pool = &db_state.0;
 
-        let enabled: Option<String> = sqlx::query_scalar(
-            "SELECT value FROM app_settings WHERE key = 'wake_word_enabled'",
-        )
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
-        let model_path: Option<String> = sqlx::query_scalar(
-            "SELECT value FROM app_settings WHERE key = 'wake_word_model_path'",
-        )
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
+        let enabled: Option<String> =
+            sqlx::query_scalar("SELECT value FROM app_settings WHERE key = 'wake_word_enabled'")
+                .fetch_optional(pool)
+                .await
+                .ok()
+                .flatten();
+        let model_path: Option<String> =
+            sqlx::query_scalar("SELECT value FROM app_settings WHERE key = 'wake_word_model_path'")
+                .fetch_optional(pool)
+                .await
+                .ok()
+                .flatten();
         (
             enabled.map(|v| v == "true" || v == "1").unwrap_or(false),
             model_path.filter(|p: &String| !p.is_empty()),
@@ -221,13 +219,12 @@ pub async fn start_all(app: AppHandle) -> Result<(), String> {
         let ambient_enabled = {
             let db_state = app.state::<crate::db::DbState>();
             let pool = &db_state.0;
-            let val: Option<String> = sqlx::query_scalar(
-                "SELECT value FROM app_settings WHERE key = 'ambient_enabled'",
-            )
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten();
+            let val: Option<String> =
+                sqlx::query_scalar("SELECT value FROM app_settings WHERE key = 'ambient_enabled'")
+                    .fetch_optional(pool)
+                    .await
+                    .ok()
+                    .flatten();
             val.map(|v| v == "true" || v == "1").unwrap_or(false)
         };
 
@@ -315,7 +312,12 @@ pub async fn start_all(app: AppHandle) -> Result<(), String> {
 /// Polls the system default microphone every 3 seconds, auto-triggers start_all when detected
 fn spawn_device_watcher(app: AppHandle) {
     // Clear old watcher first (try_lock is fine here — no contention expected)
-    let old = app.state::<AgentState>().device_watcher.try_lock().ok().and_then(|mut g| g.take());
+    let old = app
+        .state::<AgentState>()
+        .device_watcher
+        .try_lock()
+        .ok()
+        .and_then(|mut g| g.take());
     if let Some(h) = old {
         h.abort();
     }
@@ -362,7 +364,11 @@ fn spawn_device_watcher(app: AppHandle) {
         log::info!("[Agent] Device watcher stopped");
     });
 
-    let _ = app.state::<AgentState>().device_watcher.try_lock().map(|mut g| *g = Some(handle));
+    let _ = app
+        .state::<AgentState>()
+        .device_watcher
+        .try_lock()
+        .map(|mut g| *g = Some(handle));
 }
 
 // ============================================================
