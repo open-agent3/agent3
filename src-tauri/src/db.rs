@@ -83,6 +83,7 @@ pub async fn init_db(app: &tauri::AppHandle) -> Result<SqlitePool, sqlx::Error> 
         .await?;
 
     run_migrations(&pool).await?;
+    migrate_api_keys_to_keyring(&pool).await;
     Ok(pool)
 }
 
@@ -173,8 +174,6 @@ END;
 ";
 
 const MIGRATE_V2: &str = "
--- Try to add the role column if it does not exist.
-ALTER TABLE llm_providers ADD COLUMN role TEXT NOT NULL DEFAULT 'realtime';
 CREATE INDEX IF NOT EXISTS idx_llm_providers_role_active ON llm_providers(role, is_active);
 ";
 
@@ -188,6 +187,24 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     let target = MIGRATIONS.len() as i32;
 
     for v in current..target {
+        // V2: conditionally add `role` column (ALTER TABLE ADD COLUMN is not idempotent)
+        if v == 1 {
+            let has_role: bool = sqlx::query_scalar::<_, String>(
+                "SELECT name FROM pragma_table_info('llm_providers') WHERE name = 'role'",
+            )
+            .fetch_optional(pool)
+            .await?
+            .is_some();
+
+            if !has_role {
+                sqlx::query(
+                    "ALTER TABLE llm_providers ADD COLUMN role TEXT NOT NULL DEFAULT 'realtime'",
+                )
+                .execute(pool)
+                .await?;
+            }
+        }
+
         let migration_sql = MIGRATIONS[v as usize];
         sqlx::query(migration_sql).execute(pool).await?;
 
@@ -197,6 +214,28 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     }
 
     Ok(())
+}
+
+/// One-time migration: move plaintext API keys from DB into the platform keyring.
+/// Keys already migrated (sentinel value) are skipped.
+async fn migrate_api_keys_to_keyring(pool: &SqlitePool) {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, api_key FROM llm_providers WHERE api_key != '' AND api_key != ?1",
+    )
+    .bind(crate::keystore::KEYRING_SENTINEL)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    for (id, key) in rows {
+        if crate::keystore::migrate_to_keyring(&id, &key) {
+            let _ = sqlx::query("UPDATE llm_providers SET api_key = ?1 WHERE id = ?2")
+                .bind(crate::keystore::KEYRING_SENTINEL)
+                .bind(&id)
+                .execute(pool)
+                .await;
+        }
+    }
 }
 
 // ============================================================

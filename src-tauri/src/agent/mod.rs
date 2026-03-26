@@ -7,6 +7,7 @@ pub mod ambient;
 pub mod audio;
 pub mod memory;
 pub mod memory_injection;
+pub mod memory_tools;
 pub mod playback;
 pub mod realtime_ws;
 pub mod scheduler;
@@ -19,9 +20,9 @@ pub mod web_tools;
 
 use session::{SessionCommand, SessionHandle};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex as StdMutex};
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 
 // ============================================================
 // Managed State
@@ -54,11 +55,11 @@ impl Default for AgentState {
     }
 }
 
-pub struct BoardState(pub Mutex<Option<tools::BoardContent>>);
+pub struct BoardState(pub StdMutex<Option<tools::BoardContent>>);
 
 impl Default for BoardState {
     fn default() -> Self {
-        Self(Mutex::new(None))
+        Self(StdMutex::new(None))
     }
 }
 
@@ -70,7 +71,13 @@ impl Default for BoardState {
 pub fn wake_agent(app: &AppHandle) {
     let state = app.state::<AgentState>();
     let cmd_tx = {
-        let guard = state.session.lock().unwrap_or_else(|e| { log::error!("[Mutex] Poisoned, state corrupted. Propagating panic."); panic!("Mutex poisoned: {}", e); });
+        let guard = match state.session.try_lock() {
+            Ok(g) => g,
+            Err(_) => {
+                log::warn!("[Agent] Session lock contended during wake, skipping");
+                return;
+            }
+        };
         guard.as_ref().map(|h| h.cmd_tx.clone())
     };
     if let Some(tx) = cmd_tx {
@@ -84,57 +91,30 @@ pub fn wake_agent(app: &AppHandle) {
 
 /// Stop existing session + subsystems
 pub async fn stop_existing(state: &AgentState) {
-    let session_handle = {
-        let mut guard = state.session.lock().unwrap_or_else(|e| { log::error!("[Mutex] Poisoned, state corrupted. Propagating panic."); panic!("Mutex poisoned: {}", e); });
-        guard.take()
-    };
+    let session_handle = state.session.lock().await.take();
     // Stop session first, then audio and ambient (let channels close naturally)
     if let Some(h) = session_handle {
         h.stop().await;
     }
-    let audio_handle = {
-        let mut guard = state.audio.lock().unwrap_or_else(|e| { log::error!("[Mutex] Poisoned, state corrupted. Propagating panic."); panic!("Mutex poisoned: {}", e); });
-        guard.take()
-    };
+    let audio_handle = state.audio.lock().await.take();
     drop(audio_handle);
-    let playback_handle = {
-        let mut guard = state.playback.lock().unwrap_or_else(|e| { log::error!("[Mutex] Poisoned, state corrupted. Propagating panic."); panic!("Mutex poisoned: {}", e); });
-        guard.take()
-    };
+    let playback_handle = state.playback.lock().await.take();
     drop(playback_handle);
-    let ambient_handle = {
-        let mut guard = state.ambient.lock().unwrap_or_else(|e| { log::error!("[Mutex] Poisoned, state corrupted. Propagating panic."); panic!("Mutex poisoned: {}", e); });
-        guard.take()
-    };
+    let ambient_handle = state.ambient.lock().await.take();
     if let Some(h) = ambient_handle {
         h.stop();
     }
-    let scheduler_handle = {
-        let mut guard = state.scheduler.lock().unwrap_or_else(|e| { log::error!("[Mutex] Poisoned, state corrupted. Propagating panic."); panic!("Mutex poisoned: {}", e); });
-        guard.take()
-    };
+    let scheduler_handle = state.scheduler.lock().await.take();
     if let Some(h) = scheduler_handle {
         h.stop();
     }
     // Stop device watcher
-    let watcher = {
-        let mut guard = state
-            .device_watcher
-            .lock()
-            .unwrap_or_else(|e| { log::error!("[Mutex] Poisoned, state corrupted. Propagating panic."); panic!("Mutex poisoned: {}", e); });
-        guard.take()
-    };
+    let watcher = state.device_watcher.lock().await.take();
     if let Some(h) = watcher {
         h.abort();
     }
     // Stop all bridge tasks
-    let bridge_tasks = {
-        let mut guard = state
-            .bridge_tasks
-            .lock()
-            .unwrap_or_else(|e| { log::error!("[Mutex] Poisoned, state corrupted. Propagating panic."); panic!("Mutex poisoned: {}", e); });
-        std::mem::take(&mut *guard)
-    };
+    let bridge_tasks = std::mem::take(&mut *state.bridge_tasks.lock().await);
     for task in bridge_tasks {
         task.abort();
     }
@@ -211,11 +191,7 @@ pub async fn start_all(app: AppHandle) -> Result<(), String> {
     // Microphone ready, clear possibly lingering device watcher task
     {
         let state = app.state::<AgentState>();
-        let old = state
-            .device_watcher
-            .lock()
-            .unwrap_or_else(|e| { log::error!("[Mutex] Poisoned, state corrupted. Propagating panic."); panic!("Mutex poisoned: {}", e); })
-            .take();
+        let old = state.device_watcher.lock().await.take();
         if let Some(h) = old {
             h.abort();
         }
@@ -273,7 +249,7 @@ pub async fn start_all(app: AppHandle) -> Result<(), String> {
                 }
             });
             let app_state = app.state::<AgentState>();
-            app_state.bridge_tasks.lock().unwrap_or_else(|e| { log::error!("[Mutex] Poisoned, state corrupted. Propagating panic."); panic!("Mutex poisoned: {}", e); }).push(ambient_bridge);
+            app_state.bridge_tasks.lock().await.push(ambient_bridge);
 
             log::info!("[Agent] Ambient watcher started");
             Some(handle)
@@ -314,7 +290,7 @@ pub async fn start_all(app: AppHandle) -> Result<(), String> {
             }
         });
         let app_state = app.state::<AgentState>();
-        app_state.bridge_tasks.lock().unwrap_or_else(|e| { log::error!("[Mutex] Poisoned, state corrupted. Propagating panic."); panic!("Mutex poisoned: {}", e); }).push(sched_bridge);
+        app_state.bridge_tasks.lock().await.push(sched_bridge);
 
         log::info!("[Agent] Scheduler started");
         handle
@@ -322,26 +298,11 @@ pub async fn start_all(app: AppHandle) -> Result<(), String> {
 
     // 10. Save handles
     let state = app.state::<AgentState>();
-    {
-        let mut guard = state.audio.lock().map_err(|e| e.to_string())?;
-        *guard = Some(audio_handle);
-    }
-    {
-        let mut guard = state.playback.lock().map_err(|e| e.to_string())?;
-        *guard = Some(playback_handle);
-    }
-    {
-        let mut guard = state.session.lock().map_err(|e| e.to_string())?;
-        *guard = Some(session_handle);
-    }
-    {
-        let mut guard = state.ambient.lock().map_err(|e| e.to_string())?;
-        *guard = ambient_handle;
-    }
-    {
-        let mut guard = state.scheduler.lock().map_err(|e| e.to_string())?;
-        *guard = Some(scheduler_handle);
-    }
+    *state.audio.lock().await = Some(audio_handle);
+    *state.playback.lock().await = Some(playback_handle);
+    *state.session.lock().await = Some(session_handle);
+    *state.ambient.lock().await = ambient_handle;
+    *state.scheduler.lock().await = Some(scheduler_handle);
 
     Ok(())
 }
@@ -352,13 +313,8 @@ pub async fn start_all(app: AppHandle) -> Result<(), String> {
 
 /// Polls the system default microphone every 3 seconds, auto-triggers start_all when detected
 fn spawn_device_watcher(app: AppHandle) {
-    let state = app.state::<AgentState>();
-    // Clear old watcher first
-    let old = state
-        .device_watcher
-        .lock()
-        .unwrap_or_else(|e| { log::error!("[Mutex] Poisoned, state corrupted. Propagating panic."); panic!("Mutex poisoned: {}", e); })
-        .take();
+    // Clear old watcher first (try_lock is fine here — no contention expected)
+    let old = app.state::<AgentState>().device_watcher.try_lock().ok().and_then(|mut g| g.take());
     if let Some(h) = old {
         h.abort();
     }
@@ -405,11 +361,7 @@ fn spawn_device_watcher(app: AppHandle) {
         log::info!("[Agent] Device watcher stopped");
     });
 
-    let mut guard = state
-        .device_watcher
-        .lock()
-        .unwrap_or_else(|e| { log::error!("[Mutex] Poisoned, state corrupted. Propagating panic."); panic!("Mutex poisoned: {}", e); });
-    *guard = Some(handle);
+    let _ = app.state::<AgentState>().device_watcher.try_lock().map(|mut g| *g = Some(handle));
 }
 
 // ============================================================
@@ -479,7 +431,7 @@ pub async fn agent_switch_voice(
 
     // Send Reconnect signal to session
     let cmd_tx = {
-        let guard = state.session.lock().map_err(|e| e.to_string())?;
+        let guard = state.session.lock().await;
         guard.as_ref().map(|h| h.cmd_tx.clone())
     };
     if let Some(tx) = cmd_tx {

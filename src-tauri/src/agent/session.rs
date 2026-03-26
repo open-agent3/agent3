@@ -26,6 +26,63 @@ const MAX_MEMORY_TOOL_LOOKBACK_SECONDS: i64 = 30 * 24 * 60 * 60;
 const MAX_1008_RETRIES: usize = 3;
 
 // ============================================================
+// Session event-loop state (encapsulates mutable per-connection state)
+// ============================================================
+
+/// Mutable state accumulated during a single WS connection's event loop.
+/// Encapsulates what was previously 9 loose `&mut` parameters to `handle_ws_message`.
+struct SessionLoopState {
+    /// Accumulate assistant transcript delta; persisted on ResponseDone
+    transcript_buf: String,
+    /// Accumulate user transcript chunks; persisted on turn boundary
+    user_transcript_buf: String,
+    /// Pending tool calls accumulated within a single response (batch submit on ResponseDone)
+    pending_tool_calls: Vec<task_manager::TaskRequest>,
+    /// Number of outstanding tools being executed
+    tools_in_flight: usize,
+    /// Safety: count consecutive tool-triggered response rounds to prevent infinite loops
+    consecutive_tool_rounds: usize,
+    /// Count user transcript turns for post-session consolidation guard
+    user_turn_count: usize,
+    /// Timestamp of the current user turn start (first transcript chunk),
+    /// used as default cutoff for memory evidence queries.
+    user_turn_started_at: Option<i64>,
+    /// Some providers can emit duplicated completion markers for one logical turn.
+    response_done_handled_for_turn: bool,
+    /// Guard for per-connection wakeword nudge check to avoid repeated DB queries.
+    wakeword_nudge_checked: bool,
+}
+
+impl SessionLoopState {
+    fn new() -> Self {
+        Self {
+            transcript_buf: String::new(),
+            user_transcript_buf: String::new(),
+            pending_tool_calls: Vec::new(),
+            tools_in_flight: 0,
+            consecutive_tool_rounds: 0,
+            user_turn_count: 0,
+            user_turn_started_at: None,
+            response_done_handled_for_turn: false,
+            wakeword_nudge_checked: false,
+        }
+    }
+
+    /// Flush accumulated user transcript to memory persistence.
+    async fn flush_user_transcript(&mut self, memory: &MemoryStore) {
+        if self.user_transcript_buf.trim().is_empty() {
+            self.user_transcript_buf.clear();
+            return;
+        }
+        let text = std::mem::take(&mut self.user_transcript_buf);
+        if let Err(e) = memory.persist("user", &text).await {
+            log::error!("[Session] Failed to persist user text: {}", e);
+        }
+        self.user_turn_count += 1;
+    }
+}
+
+// ============================================================
 // Event payloads (emitted to frontend)
 // ============================================================
 
@@ -73,10 +130,9 @@ impl SessionHandle {
 }
 
 /// Build the full list of tools to register on the Realtime WS session.
-/// Combines AGENT_TOOLS_JSON (system tools) + change_voice tool.
+/// Combines all_tools (system tools) + change_voice tool.
 fn build_ws_tools(wakeword_enabled: bool) -> Vec<Value> {
-    let mut all_tools: Vec<Value> =
-        serde_json::from_str(tools::AGENT_TOOLS_JSON).unwrap_or_default();
+    let mut all_tools = tools::all_tools_realtime_json();
     if !wakeword_enabled {
         all_tools.retain(|t| t["name"].as_str() != Some("disconnect_session"));
     }
@@ -142,7 +198,7 @@ pub async fn start(
         onboarded.map(|o| o == "true" || o == "1").unwrap_or(false),
     );
 
-    let (_id, name, base_url, api_key, model, provider_type_str) = match provider_info {
+    let (provider_id, name, base_url, raw_api_key, model, provider_type_str) = match provider_info {
         Some(p) => p,
         None => {
             if let Err(e) = app.emit(
@@ -157,6 +213,8 @@ pub async fn start(
             return Err("No active realtime provider configured".into());
         }
     };
+
+    let api_key = crate::keystore::resolve_api_key(&provider_id, &raw_api_key);
 
     if api_key.is_empty() {
         if let Err(e) = app.emit(
@@ -560,34 +618,52 @@ async fn session_loop(
                     // Post-session memory consolidation: if meaningful conversation happened,
                     // spawn a background subagent to extract key facts
                     if user_turns >= 3 {
-                        let context = memory.recent_context(20).await.unwrap_or_default();
-                        if !context.is_empty() {
-                            let conversation_text: String = context
-                                .iter()
-                                .filter(|(role, _)| role == "user" || role == "assistant")
-                                .map(|(role, content)| {
-                                    let label = if role == "user" { "User" } else { "Assistant" };
-                                    format!("{}: {}", label, content)
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            let goal = format!(
-                                "Review this conversation and extract key facts worth remembering about the user. \
-                                 For each important fact (personal info, preferences, habits, requests), \
-                                 call remember_fact with a concise statement. \
-                                 Only store NEW information — skip greetings and small talk.\n\n\
-                                 Conversation:\n{}",
-                                conversation_text
-                            );
-                            match subagent_mgr.spawn(&goal).await {
-                                Ok(task_id) => log::info!(
-                                    "[Session] Spawned memory consolidation subagent: {}",
-                                    task_id
-                                ),
-                                Err(e) => log::warn!(
-                                    "[Session] Failed to spawn consolidation subagent: {}",
-                                    e
-                                ),
+                        // Check privacy gate: user can disable consolidation
+                        let consolidation_enabled = {
+                            let pool = &app.state::<DbState>().0;
+                            sqlx::query_scalar::<_, String>(
+                                "SELECT value FROM app_settings WHERE key = 'memory_consolidation_enabled'",
+                            )
+                            .fetch_optional(pool)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|v| v != "false" && v != "0")
+                            .unwrap_or(true) // default: enabled
+                        };
+
+                        if !consolidation_enabled {
+                            log::info!("[Session] Memory consolidation disabled by user setting");
+                        } else {
+                            let context = memory.recent_context(20).await.unwrap_or_default();
+                            if !context.is_empty() {
+                                let conversation_text: String = context
+                                    .iter()
+                                    .filter(|(role, _)| role == "user" || role == "assistant")
+                                    .map(|(role, content)| {
+                                        let label = if role == "user" { "User" } else { "Assistant" };
+                                        format!("{}: {}", label, content)
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                let goal = format!(
+                                    "Review this conversation and extract key facts worth remembering about the user. \
+                                     For each important fact (personal info, preferences, habits, requests), \
+                                     call remember_fact with a concise statement. \
+                                     Only store NEW information — skip greetings and small talk.\n\n\
+                                     Conversation:\n{}",
+                                    conversation_text
+                                );
+                                match subagent_mgr.spawn(&goal).await {
+                                    Ok(task_id) => log::info!(
+                                        "[Session] Spawned memory consolidation subagent: {}",
+                                        task_id
+                                    ),
+                                    Err(e) => log::warn!(
+                                        "[Session] Failed to spawn consolidation subagent: {}",
+                                        e
+                                    ),
+                                }
                             }
                         }
                     }
@@ -722,25 +798,7 @@ async fn run_event_loop(
     subagent_mgr: &subagents::SubagentManager,
     subagent_rx: &mut mpsc::Receiver<subagents::SubagentEvent>,
 ) -> LoopExit {
-    // Accumulate transcript delta, send complete text to memory on ResponseDone
-    let mut transcript_buf = String::new();
-    // Accumulate user transcript chunks and persist one consolidated message per turn.
-    let mut user_transcript_buf = String::new();
-    // Pending tool calls accumulated within a single response (batch submit on ResponseDone)
-    let mut pending_tool_calls: Vec<task_manager::TaskRequest> = Vec::new();
-    // Number of outstanding tools being executed
-    let mut tools_in_flight: usize = 0;
-    // Safety: count consecutive tool-triggered response rounds to prevent infinite loops
-    let mut consecutive_tool_rounds: usize = 0;
-    // Count user transcript turns for post-session consolidation guard
-    let mut user_turn_count: usize = 0;
-    // Timestamp of the current user turn start (first transcript chunk),
-    // used as default cutoff for memory evidence queries.
-    let mut user_turn_started_at: Option<i64> = None;
-    // Some providers can emit duplicated completion markers for one logical turn.
-    let mut response_done_handled_for_turn = false;
-    // Guard for per-connection wakeword nudge check to avoid repeated DB queries.
-    let mut wakeword_nudge_checked: bool = false;
+    let mut state = SessionLoopState::new();
 
     loop {
         tokio::select! {
@@ -755,7 +813,7 @@ async fn run_event_loop(
                         }
                     }
                     None => {
-                        flush_user_transcript(memory, &mut user_transcript_buf, &mut user_turn_count).await;
+                        state.flush_user_transcript(memory).await;
                         return LoopExit::Stopped;
                     }
                 }
@@ -765,8 +823,8 @@ async fn run_event_loop(
             wake = wake_rx.recv() => {
                 if matches!(wake, Some(WakeEvent::Timeout)) {
                     task_mgr.abort_all();
-                    flush_user_transcript(memory, &mut user_transcript_buf, &mut user_turn_count).await;
-                    return LoopExit::WakeTimeout(user_turn_count);
+                    state.flush_user_transcript(memory).await;
+                    return LoopExit::WakeTimeout(state.user_turn_count);
                 }
             }
 
@@ -776,17 +834,9 @@ async fn run_event_loop(
                     Some(Ok(Message::Text(raw))) => {
                         let preview: String = raw.chars().take(200).collect();
                         log::debug!("[Session] WS Text: {}", preview);
-                        let (replies, exit) = handle_ws_message(
+                        let (replies, exit) = state.handle_ws_message(
                             app, protocol, memory, playback_tx,
-                            &raw, &mut transcript_buf, &mut user_transcript_buf, &mut pending_tool_calls,
-                            &task_mgr, &mut tools_in_flight,
-                            &mut consecutive_tool_rounds,
-                            flags,
-                            subagent_mgr,
-                            &mut user_turn_count,
-                            &mut user_turn_started_at,
-                            &mut wakeword_nudge_checked,
-                            &mut response_done_handled_for_turn,
+                            &raw, &task_mgr, flags, subagent_mgr,
                         ).await;
                         for reply in replies {
                             if let Err(e) = ws_sink.send(Message::Text(reply.into())).await {
@@ -801,17 +851,9 @@ async fn run_event_loop(
                     Some(Ok(Message::Binary(data))) => {
                         log::debug!("[Session] WS Binary frame: {} bytes", data.len());
                         if let Ok(text) = std::str::from_utf8(&data) {
-                            let (replies, exit) = handle_ws_message(
+                            let (replies, exit) = state.handle_ws_message(
                                 app, protocol, memory, playback_tx,
-                                text, &mut transcript_buf, &mut user_transcript_buf, &mut pending_tool_calls,
-                                &task_mgr, &mut tools_in_flight,
-                                &mut consecutive_tool_rounds,
-                                flags,
-                                subagent_mgr,
-                                &mut user_turn_count,
-                                &mut user_turn_started_at,
-                                &mut wakeword_nudge_checked,
-                                &mut response_done_handled_for_turn,
+                                text, &task_mgr, flags, subagent_mgr,
                             ).await;
                             for reply in replies {
                                 if let Err(e) = ws_sink.send(Message::Text(reply.into())).await {
@@ -820,7 +862,7 @@ async fn run_event_loop(
                                 }
                             }
                             if let Some(e) = exit {
-                                flush_user_transcript(memory, &mut user_transcript_buf, &mut user_turn_count).await;
+                                state.flush_user_transcript(memory).await;
                                 return e;
                             }
                         }
@@ -830,18 +872,18 @@ async fn run_event_loop(
                             log::info!("[Session] WebSocket closed: code={}, reason={}", f.code, f.reason);
                             // Gemini 1008 (Policy): audio + tool call conflict
                             if f.code == tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy {
-                                flush_user_transcript(memory, &mut user_transcript_buf, &mut user_turn_count).await;
+                                state.flush_user_transcript(memory).await;
                                 return LoopExit::Disconnected1008;
                             }
                         } else {
                             log::info!("[Session] WebSocket closed (no close frame)");
                         }
-                        flush_user_transcript(memory, &mut user_transcript_buf, &mut user_turn_count).await;
+                        state.flush_user_transcript(memory).await;
                         return LoopExit::Disconnected;
                     }
                     None => {
                         log::info!("[Session] WebSocket stream ended");
-                        flush_user_transcript(memory, &mut user_transcript_buf, &mut user_turn_count).await;
+                        state.flush_user_transcript(memory).await;
                         return LoopExit::Disconnected;
                     }
                     Some(Err(e)) => {
@@ -850,7 +892,7 @@ async fn run_event_loop(
                             state: "error".into(),
                             message: Some(format!("{}", e)),
                         }) { log::warn!("[Session] Emit event error: {}", e); }
-                        flush_user_transcript(memory, &mut user_transcript_buf, &mut user_turn_count).await;
+                        state.flush_user_transcript(memory).await;
                         return LoopExit::Disconnected;
                     }
                     _ => {}
@@ -877,15 +919,15 @@ async fn run_event_loop(
                             return LoopExit::Disconnected;
                         }
 
-                        tools_in_flight = tools_in_flight.saturating_sub(1);
+                        state.tools_in_flight = state.tools_in_flight.saturating_sub(1);
 
                         // When all tools for this batch complete, trigger response generation
-                        if tools_in_flight == 0 {
-                            consecutive_tool_rounds += 1;
-                            if consecutive_tool_rounds >= MAX_TOOL_ROUNDS {
+                        if state.tools_in_flight == 0 {
+                            state.consecutive_tool_rounds += 1;
+                            if state.consecutive_tool_rounds >= MAX_TOOL_ROUNDS {
                                 log::warn!("[Session] Reached max tool rounds ({}), forcing final response", MAX_TOOL_ROUNDS);
                             } else {
-                                log::info!("[Session] Tool round {}/{} complete, triggering next response", consecutive_tool_rounds, MAX_TOOL_ROUNDS);
+                                log::info!("[Session] Tool round {}/{} complete, triggering next response", state.consecutive_tool_rounds, MAX_TOOL_ROUNDS);
                             }
                             if let Some(resp) = protocol.response_create_msg() {
                                 if let Err(e) = ws_sink.send(Message::Text(resp.into())).await {
@@ -968,20 +1010,20 @@ async fn run_event_loop(
                     Some(SessionCommand::Stop) | None => {
                         task_mgr.abort_all();
                         subagent_mgr.abort_all();
-                        flush_user_transcript(memory, &mut user_transcript_buf, &mut user_turn_count).await;
+                        state.flush_user_transcript(memory).await;
                         return LoopExit::Stopped;
                     }
                     Some(SessionCommand::Reconnect(new_voice)) => {
                         task_mgr.abort_all();
-                        flush_user_transcript(memory, &mut user_transcript_buf, &mut user_turn_count).await;
+                        state.flush_user_transcript(memory).await;
                         return LoopExit::Reconnect(new_voice);
                     }
                     Some(SessionCommand::Disconnect) => {
                         log::info!("[Session] Disconnect requested, waiting for AI farewell...");
                         // Wait up to 3s for AI to finish speaking, then disconnect
                         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                        flush_user_transcript(memory, &mut user_transcript_buf, &mut user_turn_count).await;
-                        return LoopExit::WakeTimeout(user_turn_count); // Return to sleeping
+                        state.flush_user_transcript(memory).await;
+                        return LoopExit::WakeTimeout(state.user_turn_count); // Return to sleeping
                     }
                     Some(SessionCommand::Wake) => {} // Already connected, ignore
                 }
@@ -990,28 +1032,21 @@ async fn run_event_loop(
     }
 }
 
-/// Handle a single WS message — audio playback + transcript forwarding + tool call dispatch
-/// Returns (replies, optional_exit): replies need to be sent back via WS, optional_exit carries reconnect signal when change_voice is triggered
-#[allow(clippy::too_many_arguments)]
-async fn handle_ws_message(
-    app: &AppHandle,
-    protocol: &dyn realtime_ws::RealtimeProtocol,
-    memory: &MemoryStore,
-    playback_tx: &mpsc::Sender<PlaybackCommand>,
-    raw: &str,
-    transcript_buf: &mut String,
-    user_transcript_buf: &mut String,
-    pending_tool_calls: &mut Vec<task_manager::TaskRequest>,
-    task_mgr: &task_manager::TaskManager,
-    tools_in_flight: &mut usize,
-    consecutive_tool_rounds: &mut usize,
-    flags: &Arc<audio::SharedAudioFlags>,
-    subagent_mgr: &subagents::SubagentManager,
-    user_turn_count: &mut usize,
-    user_turn_started_at: &mut Option<i64>,
-    wakeword_nudge_checked: &mut bool,
-    response_done_handled_for_turn: &mut bool,
-) -> (Vec<String>, Option<LoopExit>) {
+impl SessionLoopState {
+    /// Handle a single WS message — audio playback + transcript forwarding + tool call dispatch
+    /// Returns (replies, optional_exit): replies need to be sent back via WS, optional_exit carries reconnect signal when change_voice is triggered
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_ws_message(
+        &mut self,
+        app: &AppHandle,
+        protocol: &dyn realtime_ws::RealtimeProtocol,
+        memory: &MemoryStore,
+        playback_tx: &mpsc::Sender<PlaybackCommand>,
+        raw: &str,
+        task_mgr: &task_manager::TaskManager,
+        flags: &Arc<audio::SharedAudioFlags>,
+        subagent_mgr: &subagents::SubagentManager,
+    ) -> (Vec<String>, Option<LoopExit>) {
     let events = protocol.parse_events(raw);
     let mut replies: Vec<String> = Vec::new();
 
@@ -1028,9 +1063,9 @@ async fn handle_ws_message(
             }
             realtime_ws::WsEvent::AudioDone => {}
             realtime_ws::WsEvent::ResponseStart => {
-                *response_done_handled_for_turn = false;
+                self.response_done_handled_for_turn = false;
                 // User turn ended. Persist one consolidated user message before assistant reply starts.
-                flush_user_transcript(memory, user_transcript_buf, user_turn_count).await;
+                self.flush_user_transcript(memory).await;
                 // Mark AI as speaking — suppresses mic immediately via is_ai_speaking flag
                 flags.is_ai_speaking.store(true, Ordering::Relaxed);
                 // Clear server-side audio buffer to discard any echo that leaked before local gating
@@ -1042,7 +1077,7 @@ async fn handle_ws_message(
             }
             realtime_ws::WsEvent::Transcript(text) => {
                 log::info!("[Session] 🤖 Assistant: {}", text);
-                transcript_buf.push_str(&text);
+                self.transcript_buf.push_str(&text);
                 if let Err(e) = app.emit(
                     "agent-transcript",
                     TranscriptPayload {
@@ -1054,18 +1089,18 @@ async fn handle_ws_message(
                 }
             }
             realtime_ws::WsEvent::TranscriptDone(text) => {
-                transcript_buf.clear();
+                self.transcript_buf.clear();
                 if let Err(e) = memory.persist("assistant", &text).await {
                     log::error!("[Session] Failed to persist assistant text: {}", e);
                 }
 
                 // Show a one-time wakeword setup reminder after the first successful
                 // user<->assistant exchange when setup was previously skipped.
-                if *user_turn_count > 0
+                if self.user_turn_count > 0
                     && !text.trim().is_empty()
-                    && !*wakeword_nudge_checked
+                    && !self.wakeword_nudge_checked
                 {
-                    *wakeword_nudge_checked = true;
+                    self.wakeword_nudge_checked = true;
                     let pool = &app.state::<DbState>().0;
                     let wake_enabled: Option<String> = sqlx::query_scalar(
                         "SELECT value FROM app_settings WHERE key = 'wake_word_enabled'",
@@ -1129,12 +1164,12 @@ async fn handle_ws_message(
                     log::debug!("[Session] Ignored blank user transcript chunk");
                     continue;
                 }
-                *response_done_handled_for_turn = false;
+                self.response_done_handled_for_turn = false;
                 log::info!("[Session] 🎤 User: {}", text);
                 // New user speech resets the tool round counter
-                *consecutive_tool_rounds = 0;
-                if user_transcript_buf.is_empty() && !text.trim().is_empty() {
-                    *user_turn_started_at = Some(chrono::Utc::now().timestamp());
+                self.consecutive_tool_rounds = 0;
+                if self.user_transcript_buf.is_empty() && !text.trim().is_empty() {
+                    self.user_turn_started_at = Some(chrono::Utc::now().timestamp());
                 }
                 if let Err(e) = app.emit(
                     "agent-transcript",
@@ -1146,7 +1181,7 @@ async fn handle_ws_message(
                     log::warn!("[Session] Emit event error: {}", e);
                 }
                 // Merge incremental transcription chunks and defer persistence until turn end.
-                merge_user_transcript_chunk(user_transcript_buf, &text);
+                merge_user_transcript_chunk(&mut self.user_transcript_buf, &text);
             }
             realtime_ws::WsEvent::FunctionCall {
                 call_id,
@@ -1235,7 +1270,7 @@ async fn handle_ws_message(
                         Err(e) => serde_json::json!({"error": e}).to_string(),
                     };
                     replies.push(protocol.function_call_output_msg(&call_id, &name, &result));
-                } else if *consecutive_tool_rounds >= MAX_TOOL_ROUNDS {
+                } else if self.consecutive_tool_rounds >= MAX_TOOL_ROUNDS {
                     // Safety: reject tool calls if we've exceeded max consecutive rounds
                     log::warn!(
                         "[Session] Rejecting tool call {} — max rounds ({}) reached",
@@ -1251,7 +1286,7 @@ async fn handle_ws_message(
                     if name == "query_memory_evidence" || name == "get_last_chat_time" {
                         if let Ok(mut args) = serde_json::from_str::<Value>(&effective_arguments) {
                             let now_ts = chrono::Utc::now().timestamp();
-                            let cutoff = user_turn_started_at.unwrap_or(now_ts);
+                            let cutoff = self.user_turn_started_at.unwrap_or(now_ts);
                             let min_allowed = now_ts - MAX_MEMORY_TOOL_LOOKBACK_SECONDS;
 
                             let sanitized_before = args
@@ -1276,7 +1311,7 @@ async fn handle_ws_message(
                         effective_arguments.len()
                     );
                     log::debug!("[Session] Tool args {}: {}", name, effective_arguments);
-                    pending_tool_calls.push(task_manager::TaskRequest {
+                    self.pending_tool_calls.push(task_manager::TaskRequest {
                         call_id,
                         tool_name: name,
                         arguments: effective_arguments,
@@ -1284,26 +1319,26 @@ async fn handle_ws_message(
                 }
             }
             realtime_ws::WsEvent::ResponseDone => {
-                if *response_done_handled_for_turn {
+                if self.response_done_handled_for_turn {
                     log::debug!("[Session] Ignoring duplicated ResponseDone in same turn");
                     continue;
                 }
-                *response_done_handled_for_turn = true;
+                self.response_done_handled_for_turn = true;
                 log::info!("[Session] Response completed");
                 // Fallback flush for providers/events that may not emit ResponseStart.
-                flush_user_transcript(memory, user_transcript_buf, user_turn_count).await;
+                self.flush_user_transcript(memory).await;
                 // Clear AI speaking flag — playback buffer + echo tail handle the remaining audio
                 flags.is_ai_speaking.store(false, Ordering::Relaxed);
                 // Persist accumulated transcript to memory
-                if !transcript_buf.is_empty() {
-                    let full_text = std::mem::take(transcript_buf);
+                if !self.transcript_buf.is_empty() {
+                    let full_text = std::mem::take(&mut self.transcript_buf);
                     if let Err(e) = memory.persist("assistant", &full_text).await { log::error!("[Session] Failed to persist output: {}", e); }
                 }
                 // Submit any pending tool calls as a batch
-                if !pending_tool_calls.is_empty() {
-                    let calls: Vec<task_manager::TaskRequest> = std::mem::take(pending_tool_calls);
-                    *tools_in_flight += calls.len();
-                    log::info!("[Session] Submitting {} tool calls", *tools_in_flight);
+                if !self.pending_tool_calls.is_empty() {
+                    let calls: Vec<task_manager::TaskRequest> = std::mem::take(&mut self.pending_tool_calls);
+                    self.tools_in_flight += calls.len();
+                    log::info!("[Session] Submitting {} tool calls", self.tools_in_flight);
                     task_mgr.submit(calls);
                 }
             }
@@ -1336,13 +1371,13 @@ async fn handle_ws_message(
                     log::info!("[Session] Hard interruption. Stopping playback and aborting tasks.");
                     flags.is_ai_speaking.store(false, Ordering::Relaxed);
                     let _ = playback_tx.try_send(PlaybackCommand::FadeOut(100));
-                    if *tools_in_flight > 0 {
+                    if self.tools_in_flight > 0 {
                         log::info!(
                             "[Session] Aborting {} running tools due to interrupt",
-                            tools_in_flight
+                            self.tools_in_flight
                         );
                         task_mgr.abort_all();
-                        *tools_in_flight = 0;
+                        self.tools_in_flight = 0;
                     }
                 }
             }
@@ -1353,6 +1388,7 @@ async fn handle_ws_message(
         }
     }
     (replies, None)
+    }
 }
 
 fn merge_user_transcript_chunk(buffer: &mut String, chunk: &str) {
@@ -1393,19 +1429,4 @@ fn merge_user_transcript_chunk(buffer: &mut String, chunk: &str) {
         buffer.push(' ');
     }
     buffer.push_str(chunk);
-}
-
-async fn flush_user_transcript(
-    memory: &MemoryStore,
-    user_transcript_buf: &mut String,
-    user_turn_count: &mut usize,
-) {
-    if user_transcript_buf.trim().is_empty() {
-        user_transcript_buf.clear();
-        return;
-    }
-
-    let text = std::mem::take(user_transcript_buf);
-    if let Err(e) = memory.persist("user", &text).await { log::error!("[Session] Failed to persist user text: {}", e); }
-    *user_turn_count += 1;
 }

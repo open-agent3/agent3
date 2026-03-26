@@ -90,10 +90,12 @@ impl SharedAudioFlags {
 // Audio Handle
 // ============================================================
 
-/// Holds cpal Stream and state control
+/// Holds cpal Stream (via dedicated thread) and state control
 pub struct AudioHandle {
-    /// Keep stream alive (drop stops capture)
-    _stream: cpal::Stream,
+    /// Dedicated thread that owns the cpal::Stream (drop _stop_tx to terminate)
+    _thread: std::thread::JoinHandle<()>,
+    /// Dropping this sender signals the capture thread to exit (stream is dropped)
+    _stop_tx: std::sync::mpsc::Sender<()>,
     /// Shared audio flags (wake state, speaking, playing, session state)
     flags: Arc<SharedAudioFlags>,
     /// Processing task
@@ -105,11 +107,6 @@ pub struct AudioHandle {
     /// Capture sample rate (needed for WAV header during recording)
     pub capture_rate: u32,
 }
-
-// cpal::Stream is Send on Windows WASAPI;
-// macOS CoreAudio may require std::thread to hold, using unsafe as fallback for now
-unsafe impl Send for AudioHandle {}
-unsafe impl Sync for AudioHandle {}
 
 impl AudioHandle {
     #[allow(dead_code)]
@@ -159,17 +156,6 @@ pub fn start(
     wake_model_path: Option<String>,
     flags: Arc<SharedAudioFlags>,
 ) -> Result<AudioHandle, String> {
-    let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| crate::i18n::t("audio.no_mic"))?;
-    log::info!("[Audio] Device: {}", device.name().unwrap_or_default());
-
-    let (config, fmt) = find_input_config(&device)?;
-    let rate = config.sample_rate.0;
-    let ch = config.channels as usize;
-    log::info!("[Audio] Config: {}Hz {}ch {:?}", rate, ch, fmt);
-
     let initial = if wakeword_enabled {
         WakeState::Sleeping
     } else {
@@ -183,11 +169,65 @@ pub fn start(
     // cpal callback → async processing task
     let (raw_tx, raw_rx) = mpsc::channel::<Vec<i16>>(128);
 
-    let stream = build_stream(&device, &config, fmt, ch, raw_tx)?;
-    stream
-        .play()
-        .map_err(|e| format!("{}: {e}", crate::i18n::t("audio.start_stream_failed")))?;
-    log::info!("[Audio] Capture started");
+    // Oneshot: capture thread sends back sample rate on success
+    let (result_tx, result_rx) = std::sync::mpsc::channel::<Result<u32, String>>();
+    // Stop signal: dropping _stop_tx causes the capture thread to exit
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+
+    // Dedicated thread owns the cpal::Stream (cpal::Stream is !Send on some platforms)
+    let thread = std::thread::Builder::new()
+        .name("audio-capture".into())
+        .spawn(move || {
+            let host = cpal::default_host();
+            let device = match host.default_input_device() {
+                Some(d) => d,
+                None => {
+                    let _ = result_tx.send(Err(crate::i18n::t("audio.no_mic")));
+                    return;
+                }
+            };
+            log::info!("[Audio] Device: {}", device.name().unwrap_or_default());
+
+            let (config, fmt) = match find_input_config(&device) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = result_tx.send(Err(e));
+                    return;
+                }
+            };
+            let rate = config.sample_rate.0;
+            let ch = config.channels as usize;
+            log::info!("[Audio] Config: {}Hz {}ch {:?}", rate, ch, fmt);
+
+            let stream = match build_stream(&device, &config, fmt, ch, raw_tx) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = result_tx.send(Err(e));
+                    return;
+                }
+            };
+            if let Err(e) = stream.play() {
+                let _ = result_tx.send(Err(format!(
+                    "{}: {e}",
+                    crate::i18n::t("audio.start_stream_failed")
+                )));
+                return;
+            }
+            log::info!("[Audio] Capture started");
+            let _ = result_tx.send(Ok(rate));
+
+            // Keep stream alive — block until stop signal (sender dropped)
+            let _ = stop_rx.recv();
+            // stream dropped here → capture stops
+            log::info!("[Audio] Capture thread exiting");
+        })
+        .map_err(|e| format!("Failed to spawn audio capture thread: {e}"))?;
+
+    // Wait for the thread to report success or error
+    let rate = result_rx
+        .recv()
+        .map_err(|_| "Audio capture thread exited unexpectedly".to_string())?
+        .map_err(|e| e)?;
 
     let flags_clone = flags.clone();
     let app_panic = app.clone();
@@ -227,7 +267,8 @@ pub fn start(
     });
 
     Ok(AudioHandle {
-        _stream: stream,
+        _thread: thread,
+        _stop_tx: stop_tx,
         flags,
         _task: task_monitor,
         recording,

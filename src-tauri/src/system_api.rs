@@ -43,7 +43,7 @@ pub fn validate_shell_command(command: &str, allow_high_risk: bool) -> Result<()
         return Err("Shell command is empty".to_string());
     }
     if detect_shell_risk(command) == ShellRiskLevel::High && !allow_high_risk {
-        return Err("High-risk shell command blocked by policy. Ask user to explicitly allow and set app setting 'allow_high_risk_shell' to 'true'.".to_string());
+        return Err("This command is classified as high-risk and was blocked. Tell the user the specific command you want to run and ask for their explicit permission. They can enable high-risk commands in Settings.".to_string());
     }
     Ok(())
 }

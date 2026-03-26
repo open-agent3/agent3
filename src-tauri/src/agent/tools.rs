@@ -4,348 +4,315 @@
 /// dispatch_tool directly calls system_api functions without IPC.
 use crate::db::DbState;
 use crate::system_api;
-use chrono::TimeZone;
 use serde::Serialize;
-use sqlx::Row;
+use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
-const DEFAULT_EXCLUDE_RECENT_SECONDS: i64 = 2;
-const MAX_EXCLUDE_RECENT_SECONDS: i64 = 120;
-const MAX_MEMORY_LOOKBACK_SECONDS: i64 = 30 * 24 * 60 * 60;
+// Memory tool constants and helpers moved to memory_tools.rs
 
-/// Tool definition JSON (OpenAI Realtime API function calling format)
-pub const AGENT_TOOLS_JSON: &str = r#"[
-  {
-    "type": "function",
-    "name": "exec_shell",
-    "description": "Execute a shell command and return stdout. On Windows this runs PowerShell; on macOS/Linux it runs sh. Execute exactly the command needed, and avoid chaining multiple tool calls unless absolutely necessary.",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "command": { "type": "string", "description": "The shell command to execute" }
-      },
-      "required": ["command"]
+// ============================================================
+// Structured tool definitions
+// ============================================================
+
+/// A single tool definition with structured metadata.
+pub struct ToolDef {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub parameters: Value,
+}
+
+impl ToolDef {
+    /// Serialize to OpenAI Realtime API format (top-level name/description/parameters).
+    pub fn to_realtime_json(&self) -> Value {
+        json!({
+            "type": "function",
+            "name": self.name,
+            "description": self.description,
+            "parameters": self.parameters,
+        })
     }
-  },
-  {
-    "type": "function",
-    "name": "type_text",
-    "description": "Simulate keyboard typing. Types the given text string.",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "text": { "type": "string", "description": "The text to type" }
-      },
-      "required": ["text"]
+
+    /// Serialize to Chat Completions API format (nested under "function").
+    pub fn to_chat_json(&self) -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.parameters,
+            }
+        })
     }
-  },
-  {
-    "type": "function",
-    "name": "press_key",
-    "description": "Press a single key (e.g. 'enter', 'tab', 'escape', 'f5', or a single character).",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "key": { "type": "string", "description": "Key name" }
-      },
-      "required": ["key"]
-    }
-  },
-  {
-    "type": "function",
-    "name": "move_mouse",
-    "description": "Move the mouse cursor to absolute screen coordinates (x, y).",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "x": { "type": "integer", "description": "X coordinate" },
-        "y": { "type": "integer", "description": "Y coordinate" }
-      },
-      "required": ["x", "y"]
-    }
-  },
-  {
-    "type": "function",
-    "name": "click_mouse",
-    "description": "Click a mouse button: 'left', 'right', or 'middle'.",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "button": {
-          "type": "string",
-          "enum": ["left", "right", "middle"],
-          "description": "Mouse button"
-        }
-      },
-      "required": ["button"]
-    }
-  },
-  {
-    "type": "function",
-    "name": "render_local_ui",
-    "description": "Display content in the agent's local board window. Use for short text, code snippets, simple lists, or brief explanations. For large documents or websites, use open_external instead.",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "content_type": {
-          "type": "string",
-          "enum": ["text", "code", "html"],
-          "description": "Type of content to render"
+}
+
+/// Registry of all agent tools.
+pub fn all_tools() -> Vec<ToolDef> {
+    vec![
+        ToolDef {
+            name: "exec_shell",
+            description: "Execute a shell command and return stdout. On Windows this runs PowerShell; on macOS/Linux it runs sh. Execute exactly the command needed, and avoid chaining multiple tool calls unless absolutely necessary.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string", "description": "The shell command to execute" }
+                },
+                "required": ["command"]
+            }),
         },
-        "content": {
-          "type": "string",
-          "description": "The content to display"
+        ToolDef {
+            name: "type_text",
+            description: "Simulate keyboard typing. Types the given text string.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string", "description": "The text to type" }
+                },
+                "required": ["text"]
+            }),
         },
-        "title": {
-          "type": "string",
-          "description": "Optional window title"
-        }
-      },
-      "required": ["content_type", "content"]
-    }
-  },
-  {
-    "type": "function",
-    "name": "open_external",
-    "description": "Open a URL or file path with the OS default application (launching the actual browser UI). Do NOT use this if you just need to read a webpage's content to answer a question; use fetch_webpage instead. Use this only when the user explicitly wants to open a site to look at it themselves.",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "target": {
-          "type": "string",
-          "description": "URL (https://...) or absolute file path to open"
-        }
-      },
-      "required": ["target"]
-    }
-  },
-  {
-    "type": "function",
-    "name": "set_agent_config",
-    "description": "Set a configuration item for the agent. The user may ask you to change your name or other settings. Use key 'agent_name' to set the agent display name.",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "key": {
-          "type": "string",
-          "description": "Config key, e.g. 'agent_name'"
+        ToolDef {
+            name: "press_key",
+            description: "Press a single key (e.g. 'enter', 'tab', 'escape', 'f5', or a single character).",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string", "description": "Key name" }
+                },
+                "required": ["key"]
+            }),
         },
-        "value": {
-          "type": "string",
-          "description": "Config value"
-        }
-      },
-      "required": ["key", "value"]
-    }
-  },
-  {
-    "type": "function",
-    "name": "update_core_profile",
-    "description": "Update or insert a key-value pair in the user's Core Profile (high-priority memory). Use this for names, strict preferences, or vital context. e.g. key: 'language_preference', value: 'Rust'.",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "key": { "type": "string", "description": "Profile key" },
-        "value": { "type": "string", "description": "Profile value" }
-      },
-      "required": ["key", "value"]
-    }
-  },
-  {
-    "type": "function",
-    "name": "add_knowledge_node",
-    "description": "Add a new entity node to the Knowledge Graph.",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "id": { "type": "string", "description": "Node ID, snake_case" },
-        "label": { "type": "string", "description": "Display name of the node" },
-        "node_type": { "type": "string", "description": "e.g., 'person', 'concept', 'place'" }
-      },
-      "required": ["id", "label", "node_type"]
-    }
-  },
-  {
-    "type": "function",
-    "name": "add_knowledge_edge",
-    "description": "Add a relationship between two existing Knowledge Graph nodes.",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "source": { "type": "string", "description": "Source Node ID" },
-        "target": { "type": "string", "description": "Target Node ID" },
-        "relation": { "type": "string", "description": "Relationship, e.g. 'likes', 'works_at'" }
-      },
-      "required": ["source", "target", "relation"]
-    }
-  },
-  {
-    "type": "function",
-    "name": "observe_screen",
-    "description": "Capture a screenshot of the primary monitor. Use this BEFORE performing GUI actions to see the current screen state and locate targets. Use it AFTER actions to verify they succeeded. Returns the image with screen dimensions (width, height in pixels). Prefer calling this frequently during multi-step GUI tasks.",
-    "parameters": { "type": "object", "properties": {} }
-  },
-  {
-    "type": "function",
-    "name": "schedule_task",
-    "description": "Set a reminder or scheduled task. The agent will proactively notify the user when the time comes. Use when the user asks to be reminded about something or wants to schedule a future action.",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "description": {
-          "type": "string",
-          "description": "What to remind the user about"
+        ToolDef {
+            name: "move_mouse",
+            description: "Move the mouse cursor to absolute screen coordinates (x, y).",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "x": { "type": "integer", "description": "X coordinate" },
+                    "y": { "type": "integer", "description": "Y coordinate" }
+                },
+                "required": ["x", "y"]
+            }),
         },
-        "due_in_seconds": {
-          "type": "integer",
-          "description": "Number of seconds from now until the reminder triggers"
-        }
-      },
-      "required": ["description", "due_in_seconds"]
-    }
-  },
-  {
-    "type": "function",
-    "name": "spawn_subagent",
-    "description": "Spawn a background agent to handle a complex task while you continue conversing naturally. The subagent works independently using AI and tools, and will notify you when done or if it needs user input. Returns immediately with a task ID. Use for multi-step tasks that would interrupt conversation flow. CRITICAL: Do not ever tell the user you are spawning a subagent. Keep your internal mechanics strictly hidden and pretend you are doing it yourself.",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "goal": {
-          "type": "string",
-          "description": "Clear description of the task for the background agent to accomplish"
-        }
-      },
-      "required": ["goal"]
-    }
-  },
-  {
-    "type": "function",
-    "name": "reply_to_subagent",
-    "description": "Send a reply to a background task that asked a question. Use to provide answers, decisions, or confirmations to suspended subagents.",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "task_id": {
-          "type": "string",
-          "description": "The task ID of the subagent to reply to"
+        ToolDef {
+            name: "click_mouse",
+            description: "Click a mouse button: 'left', 'right', or 'middle'.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "button": {
+                        "type": "string",
+                        "enum": ["left", "right", "middle"],
+                        "description": "Mouse button"
+                    }
+                },
+                "required": ["button"]
+            }),
         },
-        "message": {
-          "type": "string",
-          "description": "Your reply message"
-        }
-      },
-      "required": ["task_id", "message"]
-    }
-  },
-  {
-    "type": "function",
-    "name": "search_knowledge",
-    "description": "Search the Knowledge Graph for entities and their relationships.",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "keyword": { "type": "string", "description": "Search keyword or phrase" },
-        "limit": { "type": "integer", "description": "Max results to return" }
-      },
-      "required": ["keyword"]
-    }
-  },
-  {
-    "type": "function",
-    "name": "get_last_chat_time",
-    "description": "Get deterministic last chat timestamps from episodic logs. Use this for questions like 'when did we last chat'.",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "speaker_scope": {
-          "type": "string",
-          "enum": ["both", "user_only", "assistant_only"],
-          "description": "Which speaker scope to compute last timestamp for"
+        ToolDef {
+            name: "render_local_ui",
+            description: "Display content in the agent's local board window. Use for short text, code snippets, simple lists, or brief explanations. For large documents or websites, use open_external instead.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "content_type": {
+                        "type": "string",
+                        "enum": ["text", "code", "html"],
+                        "description": "Type of content to render"
+                    },
+                    "content": { "type": "string", "description": "The content to display" },
+                    "title": { "type": "string", "description": "Optional window title" }
+                },
+                "required": ["content_type", "content"]
+            }),
         },
-        "before_unix_ts": {
-          "type": "integer",
-          "description": "Only consider records strictly earlier than this Unix timestamp"
+        ToolDef {
+            name: "open_external",
+            description: "Open a URL or file path with the OS default application (launching the actual browser UI). Do NOT use this if you just need to read a webpage's content to answer a question; use fetch_webpage instead. Use this only when the user explicitly wants to open a site to look at it themselves.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "target": { "type": "string", "description": "URL (https://...) or absolute file path to open" }
+                },
+                "required": ["target"]
+            }),
         },
-        "exclude_recent_seconds": {
-          "type": "integer",
-          "description": "When before_unix_ts is omitted, ignore records from the last N seconds"
-        }
-      }
-    }
-  },
-  {
-    "type": "function",
-    "name": "query_memory_evidence",
-    "description": "Check whether something was said before and return evidence snippets with speaker, timestamp, and confidence. Use this for questions like 'did I say X' or 'who said Y'.",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "query": {
-          "type": "string",
-          "description": "The statement or phrase to verify in memory"
+        ToolDef {
+            name: "set_agent_config",
+            description: "Set a configuration item for the agent. The user may ask you to change your name or other settings. Use key 'agent_name' to set the agent display name.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string", "description": "Config key, e.g. 'agent_name'" },
+                    "value": { "type": "string", "description": "Config value" }
+                },
+                "required": ["key", "value"]
+            }),
         },
-        "mode": {
-          "type": "string",
-          "enum": ["exact", "semantic"],
-          "description": "Matching mode: exact substring or token-overlap semantic matching"
+        ToolDef {
+            name: "update_core_profile",
+            description: "Update or insert a key-value pair in the user's Core Profile (high-priority memory). Use this for names, strict preferences, or vital context. e.g. key: 'language_preference', value: 'Rust'.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string", "description": "Profile key" },
+                    "value": { "type": "string", "description": "Profile value" }
+                },
+                "required": ["key", "value"]
+            }),
         },
-        "speaker_scope": {
-          "type": "string",
-          "enum": ["user_only", "assistant_only", "both"],
-          "description": "Which speaker roles to search"
+        ToolDef {
+            name: "add_knowledge_node",
+            description: "Add a new entity node to the Knowledge Graph.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Node ID, snake_case" },
+                    "label": { "type": "string", "description": "Display name of the node" },
+                    "node_type": { "type": "string", "description": "e.g., 'person', 'concept', 'place'" }
+                },
+                "required": ["id", "label", "node_type"]
+            }),
         },
-        "limit": {
-          "type": "integer",
-          "description": "Maximum evidence records to return"
+        ToolDef {
+            name: "add_knowledge_edge",
+            description: "Add a relationship between two existing Knowledge Graph nodes.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "source": { "type": "string", "description": "Source Node ID" },
+                    "target": { "type": "string", "description": "Target Node ID" },
+                    "relation": { "type": "string", "description": "Relationship, e.g. 'likes', 'works_at'" }
+                },
+                "required": ["source", "target", "relation"]
+            }),
         },
-        "scan_limit": {
-          "type": "integer",
-          "description": "How many recent rows to scan before filtering"
+        ToolDef {
+            name: "observe_screen",
+            description: "Capture a screenshot of the primary monitor. Use this BEFORE performing GUI actions to see the current screen state and locate targets. Use it AFTER actions to verify they succeeded. Returns the image with screen dimensions (width, height in pixels). Prefer calling this frequently during multi-step GUI tasks.",
+            parameters: json!({ "type": "object", "properties": {} }),
         },
-        "before_unix_ts": {
-          "type": "integer",
-          "description": "Only search records strictly earlier than this Unix timestamp"
+        ToolDef {
+            name: "schedule_task",
+            description: "Set a reminder or scheduled task. The agent will proactively notify the user when the time comes. Use when the user asks to be reminded about something or wants to schedule a future action.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "description": { "type": "string", "description": "What to remind the user about" },
+                    "due_in_seconds": { "type": "integer", "description": "Number of seconds from now until the reminder triggers" }
+                },
+                "required": ["description", "due_in_seconds"]
+            }),
         },
-        "exclude_recent_seconds": {
-          "type": "integer",
-          "description": "When before_unix_ts is omitted, ignore records from the last N seconds to reduce current-turn contamination"
-        }
-      },
-      "required": ["query"]
-    }
-  },
-  {
-    "type": "function",
-    "name": "disconnect_session",
-    "description": "Gracefully close the voice connection. Call this when the user says goodbye, asks you to leave, or says something like '退下吧'. Say your farewell BEFORE calling this tool — once called, the connection will close shortly after.",
-    "parameters": { "type": "object", "properties": {} }
-  },
-  {
-    "type": "function",
-    "name": "fetch_webpage",
-    "description": "Fetch the text content of a webpage. Returns the sanitized Markdown content. Useful for reading documentation or checking specific links.",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "url": { "type": "string", "description": "The URL of the webpage to fetch" }
-      },
-      "required": ["url"]
-    }
-  },
-  {
-    "type": "function",
-    "name": "search_web_duckduckgo",
-    "description": "Search DuckDuckGo and return top search results (URLs and snippets). Useful for discovering information, looking up recent news, or finding documentation links.",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "query": { "type": "string", "description": "The search query (try to use English keywords for better coding/tech results, but any language works)" }
-      },
-      "required": ["query"]
-    }
-  }
-]"#;
+        ToolDef {
+            name: "spawn_subagent",
+            description: "Spawn a background agent to handle a complex task while you continue conversing naturally. The subagent works independently using AI and tools, and will notify you when done or if it needs user input. Returns immediately with a task ID. Use for multi-step tasks that would interrupt conversation flow. CRITICAL: Do not ever tell the user you are spawning a subagent. Keep your internal mechanics strictly hidden and pretend you are doing it yourself.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "goal": { "type": "string", "description": "Clear description of the task for the background agent to accomplish" }
+                },
+                "required": ["goal"]
+            }),
+        },
+        ToolDef {
+            name: "reply_to_subagent",
+            description: "Send a reply to a background task that asked a question. Use to provide answers, decisions, or confirmations to suspended subagents.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "The task ID of the subagent to reply to" },
+                    "message": { "type": "string", "description": "Your reply message" }
+                },
+                "required": ["task_id", "message"]
+            }),
+        },
+        ToolDef {
+            name: "search_knowledge",
+            description: "Search the Knowledge Graph for entities and their relationships.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "keyword": { "type": "string", "description": "Search keyword or phrase" },
+                    "limit": { "type": "integer", "description": "Max results to return" }
+                },
+                "required": ["keyword"]
+            }),
+        },
+        ToolDef {
+            name: "get_last_chat_time",
+            description: "Get deterministic last chat timestamps from episodic logs. Use this for questions like 'when did we last chat'.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "speaker_scope": {
+                        "type": "string",
+                        "enum": ["both", "user_only", "assistant_only"],
+                        "description": "Which speaker scope to compute last timestamp for"
+                    },
+                    "before_unix_ts": { "type": "integer", "description": "Only consider records strictly earlier than this Unix timestamp" },
+                    "exclude_recent_seconds": { "type": "integer", "description": "When before_unix_ts is omitted, ignore records from the last N seconds" }
+                }
+            }),
+        },
+        ToolDef {
+            name: "query_memory_evidence",
+            description: "Check whether something was said before and return evidence snippets with speaker, timestamp, and confidence. Use this for questions like 'did I say X' or 'who said Y'.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "The statement or phrase to verify in memory" },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["exact", "semantic"],
+                        "description": "Matching mode: exact substring or token-overlap semantic matching"
+                    },
+                    "speaker_scope": {
+                        "type": "string",
+                        "enum": ["user_only", "assistant_only", "both"],
+                        "description": "Which speaker roles to search"
+                    },
+                    "limit": { "type": "integer", "description": "Maximum evidence records to return" },
+                    "scan_limit": { "type": "integer", "description": "How many recent rows to scan before filtering" },
+                    "before_unix_ts": { "type": "integer", "description": "Only search records strictly earlier than this Unix timestamp" },
+                    "exclude_recent_seconds": { "type": "integer", "description": "When before_unix_ts is omitted, ignore records from the last N seconds to reduce current-turn contamination" }
+                },
+                "required": ["query"]
+            }),
+        },
+        ToolDef {
+            name: "disconnect_session",
+            description: "Gracefully close the voice connection. Call this when the user says goodbye, asks you to leave, or says something like '退下吧'. Say your farewell BEFORE calling this tool — once called, the connection will close shortly after.",
+            parameters: json!({ "type": "object", "properties": {} }),
+        },
+        ToolDef {
+            name: "fetch_webpage",
+            description: "Fetch the text content of a webpage. Returns the sanitized Markdown content. Useful for reading documentation or checking specific links.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "The URL of the webpage to fetch" }
+                },
+                "required": ["url"]
+            }),
+        },
+        ToolDef {
+            name: "search_web_duckduckgo",
+            description: "Search DuckDuckGo and return top search results (URLs and snippets). Useful for discovering information, looking up recent news, or finding documentation links.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "The search query (try to use English keywords for better coding/tech results, but any language works)" }
+                },
+                "required": ["query"]
+            }),
+        },
+    ]
+}
+
+/// All tools serialized as Realtime API JSON array.
+pub fn all_tools_realtime_json() -> Vec<Value> {
+    all_tools().iter().map(|t| t.to_realtime_json()).collect()
+}
 
 // ============================================================
 // Board display content
@@ -372,69 +339,12 @@ pub fn is_ui_tool(name: &str) -> bool {
             | "get_last_chat_time"
             | "query_memory_evidence"
             | "search_knowledge"
+            | "fetch_webpage"
+            | "search_web_duckduckgo"
     )
 }
 
-      #[derive(Serialize)]
-      struct MemoryEvidenceHit {
-        session_id: String,
-        role: String,
-        created_at: i64,
-        created_local: String,
-        content_preview: String,
-        score: f32,
-      }
-
-      fn tokenize_lower(s: &str) -> Vec<String> {
-        s.to_lowercase()
-          .split(|c: char| !c.is_alphanumeric())
-          .filter(|t| !t.is_empty())
-          .map(|t| t.to_string())
-          .collect()
-      }
-
-      fn semantic_overlap_score(query_tokens: &[String], text_tokens: &[String]) -> f32 {
-        if query_tokens.is_empty() || text_tokens.is_empty() {
-          return 0.0;
-        }
-        let mut overlap = 0usize;
-        for q in query_tokens {
-          if text_tokens.iter().any(|t| t == q) {
-            overlap += 1;
-          }
-        }
-        overlap as f32 / query_tokens.len() as f32
-      }
-
-      fn split_cjk_chars(s: &str) -> Vec<String> {
-        s.chars()
-          .filter(|c| {
-            let is_han = ('\u{4E00}'..='\u{9FFF}').contains(c)
-              || ('\u{3400}'..='\u{4DBF}').contains(c);
-            let is_hira_kata = ('\u{3040}'..='\u{30FF}').contains(c);
-            let is_hangul = ('\u{AC00}'..='\u{D7AF}').contains(c);
-            is_han || is_hira_kata || is_hangul
-          })
-          .map(|c| c.to_string())
-          .collect()
-      }
-
-      fn resolve_evidence_cutoff(before_unix_ts: Option<i64>, exclude_recent_seconds: i64, now_ts: i64) -> i64 {
-        let fallback = now_ts - exclude_recent_seconds.clamp(0, MAX_EXCLUDE_RECENT_SECONDS);
-        let min_allowed = now_ts - MAX_MEMORY_LOOKBACK_SECONDS;
-        match before_unix_ts {
-          Some(ts) if ts >= min_allowed && ts <= now_ts + 60 => ts,
-          _ => fallback,
-        }
-      }
-
-      fn format_local_ts(ts: i64) -> String {
-        chrono::Local
-          .timestamp_opt(ts, 0)
-          .single()
-          .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-          .unwrap_or_else(|| "unknown".to_string())
-      }
+// Memory evidence types and helpers moved to memory_tools.rs
 
 /// Dispatch UI tool (requires AppHandle to create windows / open external apps)
 pub async fn dispatch_ui_tool(app: &AppHandle, name: &str, args_json: &str) -> String {
@@ -641,311 +551,38 @@ pub async fn dispatch_ui_tool(app: &AppHandle, name: &str, args_json: &str) -> S
               Err(e) => format!("Error searching knowledge: {}", e),
             }
         }
-            "get_last_chat_time" => {
-              let speaker_scope = args["speaker_scope"].as_str().unwrap_or("both").to_string();
-              if speaker_scope != "both"
-                && speaker_scope != "user_only"
-                && speaker_scope != "assistant_only"
-              {
-                return "Error: speaker_scope must be 'both', 'user_only', or 'assistant_only'"
-                  .to_string();
-              }
-
-              let exclude_recent_seconds = args["exclude_recent_seconds"]
-                .as_i64()
-                .unwrap_or(DEFAULT_EXCLUDE_RECENT_SECONDS)
-                .clamp(0, MAX_EXCLUDE_RECENT_SECONDS);
-              let now_ts = chrono::Utc::now().timestamp();
-              let cutoff = resolve_evidence_cutoff(
-                args["before_unix_ts"].as_i64(),
-                exclude_recent_seconds,
-                now_ts,
-              );
-
-              let db_state = app.state::<DbState>();
-              let pool = &db_state.0;
-
-              let last_any = sqlx::query(
-                "SELECT role, created_at, session_id, content
-                 FROM episodic_logs
-                 WHERE created_at < ?1 AND role IN ('user', 'assistant')
-                 ORDER BY created_at DESC
-                 LIMIT 1",
-              )
-              .bind(cutoff)
-              .fetch_optional(pool)
-              .await;
-
-              let last_user = sqlx::query(
-                "SELECT created_at, session_id, content
-                 FROM episodic_logs
-                 WHERE created_at < ?1 AND role = 'user'
-                 ORDER BY created_at DESC
-                 LIMIT 1",
-              )
-              .bind(cutoff)
-              .fetch_optional(pool)
-              .await;
-
-              let last_assistant = sqlx::query(
-                "SELECT created_at, session_id, content
-                 FROM episodic_logs
-                 WHERE created_at < ?1 AND role = 'assistant'
-                 ORDER BY created_at DESC
-                 LIMIT 1",
-              )
-              .bind(cutoff)
-              .fetch_optional(pool)
-              .await;
-
-              let (last_any_role, last_any_ts, last_any_session, last_any_preview) = match last_any {
-                Ok(Some(row)) => {
-                  let role: String = row.get(0);
-                  let ts: i64 = row.get(1);
-                  let sid: String = row.get(2);
-                  let content: String = row.get(3);
-                  let preview = if content.len() > 120 {
-                    format!("{}...", &content[..content.floor_char_boundary(120)])
-                  } else {
-                    content
-                  };
-                  (Some(role), Some(ts), Some(sid), Some(preview))
-                }
-                Ok(None) => (None, None, None, None),
-                Err(e) => return format!("Error querying last_any chat time: {}", e),
-              };
-
-              let map_row = |res: Result<Option<sqlx::sqlite::SqliteRow>, sqlx::Error>| {
-                match res {
-                  Ok(Some(row)) => {
-                    let ts: i64 = row.get(0);
-                    let sid: String = row.get(1);
-                    let content: String = row.get(2);
-                    let preview = if content.len() > 120 {
-                      format!("{}...", &content[..content.floor_char_boundary(120)])
-                    } else {
-                      content
-                    };
-                    (Some(ts), Some(sid), Some(preview), None::<String>)
-                  }
-                  Ok(None) => (None, None, None, None),
-                  Err(e) => (None, None, None, Some(e.to_string())),
-                }
-              };
-
-              let (last_user_ts, last_user_session, last_user_preview, user_err) = map_row(last_user);
-              if let Some(e) = user_err {
-                return format!("Error querying last_user chat time: {}", e);
-              }
-              let (last_assistant_ts, last_assistant_session, last_assistant_preview, assistant_err) =
-                map_row(last_assistant);
-              if let Some(e) = assistant_err {
-                return format!("Error querying last_assistant chat time: {}", e);
-              }
-
-              let target = match speaker_scope.as_str() {
-                "user_only" => last_user_ts,
-                "assistant_only" => last_assistant_ts,
-                _ => last_any_ts,
-              };
-
-              serde_json::json!({
-                "matched": target.is_some(),
-                "speaker_scope": speaker_scope,
-                "cutoff_unix_ts": cutoff,
-                "last_any": {
-                  "role": last_any_role,
-                  "created_at": last_any_ts,
-                  "created_local": last_any_ts.map(format_local_ts),
-                  "session_id": last_any_session,
-                  "content_preview": last_any_preview,
-                },
-                "last_user": {
-                  "created_at": last_user_ts,
-                  "created_local": last_user_ts.map(format_local_ts),
-                  "session_id": last_user_session,
-                  "content_preview": last_user_preview,
-                },
-                "last_assistant": {
-                  "created_at": last_assistant_ts,
-                  "created_local": last_assistant_ts.map(format_local_ts),
-                  "session_id": last_assistant_session,
-                  "content_preview": last_assistant_preview,
-                },
-              })
-              .to_string()
-            }
-            "query_memory_evidence" => {
-              let query = args["query"].as_str().unwrap_or("").trim().to_string();
-              if query.is_empty() {
-                return "Error: query is empty".to_string();
-              }
-
-              let mode = args["mode"].as_str().unwrap_or("exact").to_string();
-              if mode != "exact" && mode != "semantic" {
-                return "Error: mode must be 'exact' or 'semantic'".to_string();
-              }
-
-              let speaker_scope = args["speaker_scope"].as_str().unwrap_or("both").to_string();
-              if speaker_scope != "both"
-                && speaker_scope != "user_only"
-                && speaker_scope != "assistant_only"
-              {
-                return "Error: speaker_scope must be 'both', 'user_only', or 'assistant_only'"
-                  .to_string();
-              }
-
-              let limit = args["limit"].as_i64().unwrap_or(5).clamp(1, 20) as usize;
-              let scan_limit = args["scan_limit"].as_i64().unwrap_or(200).clamp(20, 500) as i64;
-              let exclude_recent_seconds = args["exclude_recent_seconds"]
-                .as_i64()
-                .unwrap_or(DEFAULT_EXCLUDE_RECENT_SECONDS)
-                .clamp(0, MAX_EXCLUDE_RECENT_SECONDS);
-              let now_ts = chrono::Utc::now().timestamp();
-              let cutoff = resolve_evidence_cutoff(
-                args["before_unix_ts"].as_i64(),
-                exclude_recent_seconds,
-                now_ts,
-              );
-
-              let db_state = app.state::<DbState>();
-              let pool = &db_state.0;
-
-              let rows_result = if speaker_scope == "both" {
-                sqlx::query(
-                  "SELECT session_id, role, content, created_at
-                   FROM episodic_logs
-                   WHERE created_at < ?1 AND role IN ('user', 'assistant')
-                   ORDER BY created_at DESC
-                   LIMIT ?2",
-                )
-                .bind(cutoff)
-                .bind(scan_limit)
-                .fetch_all(pool)
-                .await
-              } else if speaker_scope == "user_only" {
-                sqlx::query(
-                  "SELECT session_id, role, content, created_at
-                   FROM episodic_logs
-                   WHERE created_at < ?1 AND role = 'user'
-                   ORDER BY created_at DESC
-                   LIMIT ?2",
-                )
-                .bind(cutoff)
-                .bind(scan_limit)
-                .fetch_all(pool)
-                .await
-              } else {
-                sqlx::query(
-                  "SELECT session_id, role, content, created_at
-                   FROM episodic_logs
-                   WHERE created_at < ?1 AND role = 'assistant'
-                   ORDER BY created_at DESC
-                   LIMIT ?2",
-                )
-                .bind(cutoff)
-                .bind(scan_limit)
-                .fetch_all(pool)
-                .await
-              };
-
-              let rows = match rows_result {
-                Ok(r) => r,
-                Err(e) => return format!("Error querying episodic memory: {}", e),
-              };
-
-              let query_lower = query.to_lowercase();
-              let query_tokens = tokenize_lower(&query);
-              let query_cjk = split_cjk_chars(&query);
-              let mut hits: Vec<MemoryEvidenceHit> = Vec::new();
-
-              for row in rows {
-                let session_id: String = row.get(0);
-                let role: String = row.get(1);
-                let content: String = row.get(2);
-                let created_at: i64 = row.get(3);
-
-                let score = if mode == "exact" {
-                  if content.to_lowercase().contains(&query_lower) {
-                    1.0
-                  } else {
-                    0.0
-                  }
-                } else {
-                  let content_lower = content.to_lowercase();
-                  if content_lower.contains(&query_lower) {
-                    1.0
-                  } else {
-                  let content_tokens = tokenize_lower(&content);
-                  let token_score = semantic_overlap_score(&query_tokens, &content_tokens);
-                  if token_score > 0.0 {
-                    token_score
-                  } else {
-                    // Fallback for CJK queries where alnum tokenization may produce weak signals.
-                    let content_cjk = split_cjk_chars(&content);
-                    semantic_overlap_score(&query_cjk, &content_cjk)
-                  }
-                  }
-                };
-
-                if score <= 0.0 {
-                  continue;
-                }
-
-                let content_preview = if content.len() > 180 {
-                  format!("{}...", &content[..content.floor_char_boundary(180)])
-                } else {
-                  content
-                };
-
-                let created_local = format_local_ts(created_at);
-
-                hits.push(MemoryEvidenceHit {
-                  session_id,
-                  role,
-                  created_at,
-                  created_local,
-                  content_preview,
-                  score,
-                });
-              }
-
-              hits.sort_by(|a, b| {
-                b.score
-                  .partial_cmp(&a.score)
-                  .unwrap_or(std::cmp::Ordering::Equal)
-                  .then_with(|| b.created_at.cmp(&a.created_at))
-              });
-
-              let total_hits = hits.len();
-              let evidence: Vec<MemoryEvidenceHit> = hits.into_iter().take(limit).collect();
-              let top_score = evidence.first().map(|h| h.score).unwrap_or(0.0);
-
-              serde_json::json!({
-                "matched": !evidence.is_empty(),
-                "query": query,
-                "mode": mode,
-                "speaker_scope": speaker_scope,
-                "cutoff_unix_ts": cutoff,
-                "scanned_limit": scan_limit,
-                "total_hits": total_hits,
-                "confidence": top_score,
-                "evidence": evidence,
-              })
-              .to_string()
-            }
+        "get_last_chat_time" => {
+            super::memory_tools::handle_get_last_chat_time(app, &args).await
+        }
+        "query_memory_evidence" => {
+            super::memory_tools::handle_query_memory_evidence(app, &args).await
+        }
         "disconnect_session" => {
             log::info!("[Tools] Disconnect session requested by AI");
             let agent_state = app.state::<super::AgentState>();
             let cmd_tx = {
-                let guard = agent_state.session.lock().ok();
-                guard.and_then(|g| g.as_ref().map(|h| h.cmd_tx.clone()))
+                let guard = agent_state.session.lock().await;
+                guard.as_ref().map(|h| h.cmd_tx.clone())
             };
             if let Some(tx) = cmd_tx {
                 let _ = tx.try_send(super::session::SessionCommand::Disconnect);
                 "OK: Disconnect initiated. Say your farewell now — connection will close in 3 seconds.".to_string()
             } else {
                 "Error: no active session to disconnect".to_string()
+            }
+        }
+        "fetch_webpage" => {
+            let url = args.get("url").and_then(|u| u.as_str()).unwrap_or_default();
+            match crate::agent::web_tools::fetch_webpage(url).await {
+                Ok(md) => md,
+                Err(e) => format!("Error: {}", e),
+            }
+        }
+        "search_web_duckduckgo" => {
+            let query = args.get("query").and_then(|q| q.as_str()).unwrap_or_default();
+            match crate::agent::web_tools::search_web_duckduckgo(query).await {
+                Ok(md) => md,
+                Err(e) => format!("Error: {}", e),
             }
         }
         _ => format!("Unknown UI tool: {}", name),
@@ -1019,14 +656,6 @@ fn dispatch_tool_inner(app: Option<&AppHandle>, name: &str, args_json: &str) -> 
             }))
             .unwrap_or_default()
         }),
-        "fetch_webpage" => {
-            let url = args.get("url").and_then(|u| u.as_str()).unwrap_or_default();
-            crate::agent::web_tools::fetch_webpage(url)
-        }
-        "search_web_duckduckgo" => {
-            let query = args.get("query").and_then(|q| q.as_str()).unwrap_or_default();
-            crate::agent::web_tools::search_web_duckduckgo(query)
-        }
         _ => Err(format!("Unknown function: {}", name)),
     };
 
@@ -1054,7 +683,25 @@ pub fn dispatch_tool_with_app(app: &AppHandle, name: &str, args_json: &str) -> S
 
 #[cfg(test)]
 mod tests {
-  use super::{format_local_ts, resolve_evidence_cutoff, semantic_overlap_score, split_cjk_chars, tokenize_lower};
+  use crate::agent::memory_tools::{format_local_ts, resolve_evidence_cutoff, semantic_overlap_score, split_cjk_chars, tokenize_lower};
+  use super::*;
+
+  #[test]
+  fn all_tools_json_is_valid() {
+    let tools = all_tools();
+    assert_eq!(tools.len(), 21, "Expected 21 tools");
+    for t in &tools {
+        assert!(!t.name.is_empty(), "Tool name must not be empty");
+        assert!(!t.description.is_empty(), "Tool description must not be empty");
+        assert_eq!(t.parameters["type"], "object", "Parameters must be an object for {}", t.name);
+        // Verify both serialisation formats produce valid JSON
+        let rt = t.to_realtime_json();
+        assert_eq!(rt["type"], "function");
+        assert_eq!(rt["name"], t.name);
+        let chat = t.to_chat_json();
+        assert_eq!(chat["function"]["name"], t.name);
+    }
+  }
 
   #[test]
   fn cutoff_prefers_explicit_before_timestamp() {

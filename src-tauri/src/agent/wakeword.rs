@@ -66,8 +66,8 @@ fn pcm_to_wav(samples: &[i16], sample_rate: u32) -> Result<Vec<u8>, String> {
 
 /// Start recording wakeword samples (notify audio module to start buffering)
 #[tauri::command]
-pub fn wakeword_start_record(state: tauri::State<'_, super::AgentState>) -> Result<(), String> {
-    let guard = state.audio.lock().map_err(|e| e.to_string())?;
+pub async fn wakeword_start_record(state: tauri::State<'_, super::AgentState>) -> Result<(), String> {
+    let guard = state.audio.lock().await;
     let handle = guard
         .as_ref()
         .ok_or_else(|| crate::i18n::t("audio.no_module"))?;
@@ -78,8 +78,8 @@ pub fn wakeword_start_record(state: tauri::State<'_, super::AgentState>) -> Resu
 
 /// Stop recording and return recording duration (seconds)
 #[tauri::command]
-pub fn wakeword_stop_record(state: tauri::State<'_, super::AgentState>) -> Result<f32, String> {
-    let guard = state.audio.lock().map_err(|e| e.to_string())?;
+pub async fn wakeword_stop_record(state: tauri::State<'_, super::AgentState>) -> Result<f32, String> {
+    let guard = state.audio.lock().await;
     let handle = guard
         .as_ref()
         .ok_or_else(|| crate::i18n::t("audio.no_module"))?;
@@ -102,12 +102,12 @@ pub fn wakeword_stop_record(state: tauri::State<'_, super::AgentState>) -> Resul
 
 /// Save the most recently recorded samples to a temporary file
 #[tauri::command]
-pub fn wakeword_save_sample(
+pub async fn wakeword_save_sample(
     app: AppHandle,
     index: usize,
     state: tauri::State<'_, super::AgentState>,
 ) -> Result<(), String> {
-    let guard = state.audio.lock().map_err(|e| e.to_string())?;
+    let guard = state.audio.lock().await;
     let handle = guard
         .as_ref()
         .ok_or_else(|| crate::i18n::t("audio.no_module"))?;

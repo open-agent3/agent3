@@ -5,6 +5,7 @@
 /// Communication: MPSC events → session (questions/completions), oneshot for user replies.
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -14,6 +15,16 @@ use tokio::task::AbortHandle;
 
 use crate::agent::tools;
 use crate::db::DbState;
+
+// ============================================================
+// Resource limits
+// ============================================================
+
+/// Maximum number of subagents running concurrently
+const MAX_CONCURRENT_SUBAGENTS: usize = 5;
+
+/// Per-task timeout: abort if a single subagent exceeds this duration
+const TASK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 // ============================================================
 // Types
@@ -63,6 +74,17 @@ impl SubagentManager {
 
     /// Spawn a new background subagent. Returns the task ID immediately.
     pub async fn spawn(&self, goal: &str) -> Result<String, String> {
+        // Enforce concurrency limit
+        {
+            let map = self.tasks.lock().unwrap();
+            if map.len() >= MAX_CONCURRENT_SUBAGENTS {
+                return Err(format!(
+                    "Maximum concurrent subagents ({}) reached — wait for one to finish",
+                    MAX_CONCURRENT_SUBAGENTS
+                ));
+            }
+        }
+
         let task_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
 
         let provider = resolve_provider(&self.app).await?;
@@ -74,15 +96,34 @@ impl SubagentManager {
         let tasks = self.tasks.clone();
         let pending_replies = self.pending_replies.clone();
 
-        let handle = tokio::spawn(subagent_loop(
-            app,
-            tid,
-            goal,
-            provider,
-            event_tx,
-            tasks.clone(),
-            pending_replies,
-        ));
+        let handle = tokio::spawn(async move {
+            let result = tokio::time::timeout(
+                TASK_TIMEOUT,
+                subagent_loop(
+                    app.clone(),
+                    tid.clone(),
+                    goal,
+                    provider,
+                    event_tx.clone(),
+                    tasks.clone(),
+                    pending_replies,
+                ),
+            )
+            .await;
+
+            if result.is_err() {
+                let msg = format!("Task {} timed out after {}s", tid, TASK_TIMEOUT.as_secs());
+                log::warn!("[Subagent] {}", msg);
+                emit_log(&app, &tid, "error", &msg);
+                let _ = event_tx
+                    .send(SubagentEvent::Failed {
+                        task_id: tid.clone(),
+                        error: msg,
+                    })
+                    .await;
+                cleanup(&tasks, &tid);
+            }
+        });
 
         {
             let mut map = self.tasks.lock().unwrap();
@@ -148,9 +189,9 @@ async fn resolve_provider(app: &AppHandle) -> Result<ChatProvider, String> {
         }
 
         // Try dedicated background provider first, fall back to active realtime provider
-        let background_row: Option<(String, String, String, String)> = if has_role_column {
+        let background_row: Option<(String, String, String, String, String)> = if has_role_column {
             sqlx::query_as(
-                "SELECT base_url, api_key, model, provider_type FROM llm_providers \
+                "SELECT id, base_url, api_key, model, provider_type FROM llm_providers \
                  WHERE role = 'background' AND is_active = 1 LIMIT 1",
             )
             .fetch_optional(pool)
@@ -168,10 +209,10 @@ async fn resolve_provider(app: &AppHandle) -> Result<ChatProvider, String> {
         }
 
         let fallback_query = if has_role_column {
-            "SELECT base_url, api_key, model, provider_type FROM llm_providers \
+            "SELECT id, base_url, api_key, model, provider_type FROM llm_providers \
                  WHERE is_active = 1 AND role IN ('realtime', 'sensory') LIMIT 1"
         } else {
-            "SELECT base_url, api_key, model, provider_type FROM llm_providers \
+            "SELECT id, base_url, api_key, model, provider_type FROM llm_providers \
                  WHERE is_active = 1 LIMIT 1"
         };
 
@@ -185,7 +226,8 @@ async fn resolve_provider(app: &AppHandle) -> Result<ChatProvider, String> {
                 .ok_or_else(|| "No LLM provider available for subagent".to_string())?,
         };
 
-        let (base_url, api_key, model, provider_type) = row;
+        let (id, base_url, raw_api_key, model, provider_type) = row;
+        let api_key = crate::keystore::resolve_api_key(&id, &raw_api_key);
 
     Ok(ChatProvider {
         api_key,
@@ -195,7 +237,7 @@ async fn resolve_provider(app: &AppHandle) -> Result<ChatProvider, String> {
 }
 
 /// Derive Chat Completions REST URL from the Realtime WS base URL
-fn derive_chat_url(base_url: &str, provider_type: &str) -> String {
+pub fn derive_chat_url(base_url: &str, provider_type: &str) -> String {
     match provider_type.to_lowercase().as_str() {
         "gemini" => "https://generativelanguage.googleapis.com/v1beta/chat/completions".to_string(),
         _ => {
@@ -216,7 +258,7 @@ fn derive_chat_url(base_url: &str, provider_type: &str) -> String {
 }
 
 /// Map realtime model names to their Chat Completions equivalents
-fn derive_chat_model(realtime_model: &str) -> String {
+pub fn derive_chat_model(realtime_model: &str) -> String {
     if realtime_model.contains("realtime") {
         if realtime_model.contains("mini") {
             "gpt-4o-mini".to_string()
@@ -249,9 +291,6 @@ fn emit_log(app: &AppHandle, task_id: &str, status: &str, message: &str) {
 // ============================================================
 
 fn build_subagent_tools() -> Vec<Value> {
-    let realtime_tools: Vec<Value> =
-        serde_json::from_str(tools::AGENT_TOOLS_JSON).unwrap_or_default();
-
     // Tools excluded from subagent use (prevent recursive spawning + token explosion)
     let excluded = [
         "schedule_task",
@@ -260,22 +299,10 @@ fn build_subagent_tools() -> Vec<Value> {
         "observe_screen",
     ];
 
-    let mut chat_tools: Vec<Value> = realtime_tools
+    let mut chat_tools: Vec<Value> = tools::all_tools()
         .iter()
-        .filter(|t| {
-            let name = t["name"].as_str().unwrap_or("");
-            !excluded.contains(&name)
-        })
-        .map(|t| {
-            json!({
-                "type": "function",
-                "function": {
-                    "name": t["name"],
-                    "description": t["description"],
-                    "parameters": t["parameters"]
-                }
-            })
-        })
+        .filter(|t| !excluded.contains(&t.name))
+        .map(|t| t.to_chat_json())
         .collect();
 
     // Add ask_user tool (subagent-only)

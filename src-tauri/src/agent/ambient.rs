@@ -71,23 +71,42 @@ async fn ambient_loop(
     event_tx: mpsc::Sender<AmbientEvent>,
     stop_flag: Arc<AtomicBool>,
 ) {
-    // Read HTTP LLM config from DB (any active provider)
+    // Read HTTP LLM config: prefer a 'background' role provider, fall back to active realtime
     let llm_config = {
         let db_state = app.state::<DbState>();
         let pool = &db_state.0;
-        let result = sqlx::query_as::<_, (String, String, String)>(
-            "SELECT base_url, api_key, model FROM llm_providers WHERE is_active = 1 LIMIT 1",
+
+        // Try background provider first
+        let bg_row: Option<(String, String, String, String, String)> = sqlx::query_as(
+            "SELECT id, base_url, api_key, model, provider_type FROM llm_providers \
+             WHERE is_active = 1 AND role = 'background' LIMIT 1",
         )
         .fetch_optional(pool)
         .await
         .ok()
-        .flatten()
-        .map(|(base_url, api_key, model)| HttpLlmConfig {
-            base_url: base_url.clone(),
-            api_key: api_key.clone(),
-            model: model.clone(),
-        });
-        result
+        .flatten();
+
+        // Fall back to any active provider
+        let row = match bg_row {
+            Some(r) => Some(r),
+            None => sqlx::query_as(
+                "SELECT id, base_url, api_key, model, provider_type FROM llm_providers \
+                 WHERE is_active = 1 LIMIT 1",
+            )
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten(),
+        };
+
+        row.map(|(id, base_url, raw_api_key, model, provider_type)| {
+            let api_key = crate::keystore::resolve_api_key(&id, &raw_api_key);
+            HttpLlmConfig {
+                base_url: super::subagents::derive_chat_url(&base_url, &provider_type),
+                api_key,
+                model: super::subagents::derive_chat_model(&model),
+            }
+        })
     };
 
     let llm_config = match llm_config {
@@ -266,11 +285,11 @@ async fn analyze_screen_for_help(config: &HttpLlmConfig, thumb: &Thumbnail) -> O
 
     let client = Client::new();
     let effective_url = if config.base_url.is_empty() {
-        "https://api.openai.com/v1".to_string()
+        "https://api.openai.com/v1/chat/completions".to_string()
     } else {
-        config.base_url.trim_end_matches('/').to_string()
+        config.base_url.clone()
     };
-    let url = format!("{}/chat/completions", effective_url);
+    let url = effective_url;
 
     let body = json!({
         "model": config.model,

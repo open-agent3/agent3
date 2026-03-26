@@ -1,6 +1,7 @@
 mod agent;
 mod db;
 mod i18n;
+pub mod keystore;
 mod system_api;
 mod tray;
 
