@@ -152,6 +152,12 @@ pub trait RealtimeProtocol: Send + Sync {
         None
     }
 
+    /// Maximum accepted bytes for tool output payload to avoid provider-side rejection.
+    /// Returns `None` if no explicit cap is required.
+    fn max_tool_output_bytes(&self) -> Option<usize> {
+        None
+    }
+
     /// Build input audio buffer clear message (discard buffered echo on server)
     fn input_audio_clear_msg(&self) -> Option<String> {
         None
@@ -951,13 +957,18 @@ impl RealtimeProtocol for GeminiProtocol {
                 "clientContent": {
                     "turns": [{
                         "role": "user",
-                        "parts": [{ "text": "[System Directive] Tool results are now available. Continue the task and speak naturally to the user. Ask one concise follow-up question if needed." }]
+                        "parts": [{ "text": "[System Directive] Tool results are now available. If the task is already completed, give a brief completion update and stop calling tools. Only call another tool if absolutely necessary." }]
                     }],
                     "turnComplete": true
                 }
             })
             .to_string(),
         )
+    }
+
+    fn max_tool_output_bytes(&self) -> Option<usize> {
+        // Keep toolResponse well below provider argument limits.
+        Some(256_000)
     }
 
     // response_create_msg: Gemini auto-generates a reply after sending toolResponse, no manual trigger needed

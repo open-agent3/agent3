@@ -53,6 +53,55 @@ struct SessionLoopState {
     wakeword_nudge_checked: bool,
 }
 
+fn compact_tool_output_for_provider(
+    protocol: &dyn realtime_ws::RealtimeProtocol,
+    tool_name: &str,
+    output: &str,
+) -> String {
+    let Some(max_bytes) = protocol.max_tool_output_bytes() else {
+        return output.to_string();
+    };
+
+    if output.len() <= max_bytes {
+        return output.to_string();
+    }
+
+    if tool_name == "observe_screen" {
+        if let Ok(v) = serde_json::from_str::<Value>(output) {
+            let width = v.get("width").and_then(|x| x.as_i64()).unwrap_or_default();
+            let height = v.get("height").and_then(|x| x.as_i64()).unwrap_or_default();
+            let image_base64_bytes = v
+                .get("image_base64")
+                .and_then(|x| x.as_str())
+                .map(|s| s.len())
+                .unwrap_or_default();
+
+            return serde_json::json!({
+                "status": "truncated",
+                "tool": tool_name,
+                "reason": "payload_too_large",
+                "width": width,
+                "height": height,
+                "image_base64_bytes": image_base64_bytes,
+                "message": "Screenshot payload omitted due to provider size limits. Ask the user for a narrower target region or perform another lightweight check.",
+            })
+            .to_string();
+        }
+    }
+
+    let keep = max_bytes.saturating_sub(160).max(64);
+    let preview: String = output.chars().take(keep).collect();
+    serde_json::json!({
+        "status": "truncated",
+        "tool": tool_name,
+        "reason": "payload_too_large",
+        "original_bytes": output.len(),
+        "max_bytes": max_bytes,
+        "preview": preview,
+    })
+    .to_string()
+}
+
 impl SessionLoopState {
     fn new() -> Self {
         Self {
@@ -927,14 +976,30 @@ async fn run_event_loop(
                     Some(task_manager::TaskEvent::Completed(result)) => {
                         log::info!("[Session] Tool {} completed: {} bytes", result.tool_name, result.output.len());
 
+                        let effective_output = compact_tool_output_for_provider(
+                            protocol,
+                            &result.tool_name,
+                            &result.output,
+                        );
+                        if effective_output.len() != result.output.len() {
+                            log::warn!(
+                                "[Session] Tool output compacted for provider limits: tool={}, original_bytes={}, compacted_bytes={}",
+                                result.tool_name,
+                                result.output.len(),
+                                effective_output.len()
+                            );
+                        }
+
                         // Persist tool result to memory
-                        if let Err(e) = memory.persist_tool_result(&result.tool_name, &result.output).await {
+                        if let Err(e) = memory.persist_tool_result(&result.tool_name, &effective_output).await {
                             log::error!("[Session] Failed to persist tool result: {}", e);
                         }
 
                         // Send function_call_output back to WS
                         let output_msg = protocol.function_call_output_msg(
-                            &result.call_id, &result.tool_name, &result.output,
+                            &result.call_id,
+                            &result.tool_name,
+                            &effective_output,
                         );
                         if let Err(e) = ws_sink.send(Message::Text(output_msg.into())).await {
                             log::error!("[Session] Failed to send function_call_output: {}", e);
