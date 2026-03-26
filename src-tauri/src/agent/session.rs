@@ -161,6 +161,7 @@ fn build_ws_tools(wakeword_enabled: bool) -> Vec<Value> {
 
 pub async fn start(
     app: AppHandle,
+    inject_tx: mpsc::Sender<String>,
     inject_rx: mpsc::Receiver<String>,
     audio_rx: mpsc::Receiver<String>,
     wake_rx: mpsc::Receiver<WakeEvent>,
@@ -264,6 +265,7 @@ pub async fn start(
         ws_tools,
         audio_rx,
         cmd_rx,
+        inject_tx,
         inject_rx,
         wake_rx,
         flags,
@@ -316,6 +318,7 @@ async fn session_loop(
     ws_tools: Vec<Value>,
     mut audio_rx: mpsc::Receiver<String>,
     mut cmd_rx: mpsc::Receiver<SessionCommand>,
+    inject_tx: mpsc::Sender<String>,
     mut inject_rx: mpsc::Receiver<String>,
     mut wake_rx: mpsc::Receiver<WakeEvent>,
     flags: Arc<audio::SharedAudioFlags>,
@@ -559,7 +562,7 @@ async fn session_loop(
 
             // Create task manager for tool execution
             let (task_event_tx, task_event_rx) = mpsc::channel::<task_manager::TaskEvent>(1024);
-            let task_mgr = task_manager::TaskManager::new(app.clone(), task_event_tx);
+            let task_mgr = task_manager::TaskManager::new(app.clone(), task_event_tx, inject_tx.clone());
 
             // Main event loop
             let exit = run_event_loop(
@@ -1378,6 +1381,17 @@ impl SessionLoopState {
                         );
                         task_mgr.abort_all();
                         self.tools_in_flight = 0;
+                    }
+                    if !self.transcript_buf.is_empty() {
+                        let partial = self.transcript_buf.clone();
+                        let sys_msg = format!(
+                            "SYSTEM: The user just interrupted you. Your last partial sentence was '{}'. Please listen to what they say next and respond naturally.",
+                            partial
+                        );
+                        let inject_msg = protocol.inject_speech_msg(&sys_msg);
+                        replies.push(inject_msg);
+                        // Clear the buffer since it was interrupted
+                        self.transcript_buf.clear();
                     }
                 }
             }

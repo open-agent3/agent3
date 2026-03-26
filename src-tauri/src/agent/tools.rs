@@ -54,7 +54,8 @@ pub fn all_tools() -> Vec<ToolDef> {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "command": { "type": "string", "description": "The shell command to execute" }
+                    "command": { "type": "string", "description": "The shell command to execute" },
+                    "run_in_background": { "type": "boolean", "description": "Set to true for long-running scripts (e.g. loops, servers, slow compilations). The command will run detached and notify you when finished." }
                 },
                 "required": ["command"]
             }),

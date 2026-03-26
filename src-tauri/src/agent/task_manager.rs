@@ -77,16 +77,18 @@ struct ExecShellResult {
 pub struct TaskManager {
     app: AppHandle,
     event_tx: mpsc::Sender<TaskEvent>,
+    inject_tx: mpsc::Sender<String>,
     /// Running tasks map: call_id → abort handle
     running: Arc<Mutex<HashMap<String, RunningTask>>>,
     metrics: Arc<TaskMetrics>,
 }
 
 impl TaskManager {
-    pub fn new(app: AppHandle, event_tx: mpsc::Sender<TaskEvent>) -> Self {
+    pub fn new(app: AppHandle, event_tx: mpsc::Sender<TaskEvent>, inject_tx: mpsc::Sender<String>) -> Self {
         Self {
             app,
             event_tx,
+            inject_tx,
             running: Arc::new(Mutex::new(HashMap::new())),
             metrics: Arc::new(TaskMetrics::new()),
         }
@@ -135,6 +137,12 @@ impl TaskManager {
         let event_tx = self.event_tx.clone();
         let app = self.app.clone();
         
+        let is_background = if let Ok(serde_json::Value::Object(map)) = serde_json::from_str(&arguments) {
+            map.get("run_in_background").and_then(|v| v.as_bool()).unwrap_or(false)
+        } else {
+            false
+        };
+
         let shell_child = if tool_name == "exec_shell" {
             Some(Arc::new(Mutex::new(None)))
         } else {
@@ -176,6 +184,27 @@ impl TaskManager {
             };
             output
         });
+
+        if is_background {
+            let instant_result = TaskResult {
+                call_id: call_id.clone(),
+                tool_name: tool_name.clone(),
+                output: "Task started in background. Please say something like 'I have started the process.' and wait.".to_string(),
+            };
+            let _ = self.event_tx.try_send(TaskEvent::Completed(instant_result));
+            
+            let bg_tool = tool_name.clone();
+            let bg_inject = self.inject_tx.clone();
+            tokio::spawn(async move {
+                let final_output = match worker_join.await {
+                    Ok(o) => o,
+                    Err(_) => "System Error: Task failed".to_string(),
+                };
+                let msg = format!("SYSTEM: Background task '{}' just finished. Output:\n{}\nPlease inform the user casually.", bg_tool, final_output);
+                let _ = bg_inject.send(msg).await;
+            });
+            return;
+        }
 
         let call_id_key = call_id.clone();
         let abort_handle = worker_join.abort_handle();

@@ -206,6 +206,7 @@ pub async fn start_all(app: AppHandle) -> Result<(), String> {
     // 8. Start session (voice I/O + direct tool execution + memory persistence)
     let session_handle = session::start(
         app.clone(),
+        inject_tx.clone(),
         inject_rx,
         audio_rx,
         wake_rx,
