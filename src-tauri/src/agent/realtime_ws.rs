@@ -144,6 +144,14 @@ pub trait RealtimeProtocol: Send + Sync {
         None
     }
 
+    /// Build provider-specific continuation message after tool outputs are sent.
+    ///
+    /// Some providers need an explicit nudge to continue generation after toolResponse.
+    /// If `None`, caller should fall back to `response_create_msg` when available.
+    fn tool_continuation_msg(&self) -> Option<String> {
+        None
+    }
+
     /// Build input audio buffer clear message (discard buffered echo on server)
     fn input_audio_clear_msg(&self) -> Option<String> {
         None
@@ -937,6 +945,21 @@ impl RealtimeProtocol for GeminiProtocol {
         .to_string()
     }
 
+    fn tool_continuation_msg(&self) -> Option<String> {
+        Some(
+            json!({
+                "clientContent": {
+                    "turns": [{
+                        "role": "user",
+                        "parts": [{ "text": "[System Directive] Tool results are now available. Continue the task and speak naturally to the user. Ask one concise follow-up question if needed." }]
+                    }],
+                    "turnComplete": true
+                }
+            })
+            .to_string(),
+        )
+    }
+
     // response_create_msg: Gemini auto-generates a reply after sending toolResponse, no manual trigger needed
 
     fn requires_setup_ack(&self) -> bool {
@@ -1297,4 +1320,70 @@ fn resample_24k_to_16k(data: &[u8]) -> Vec<u8> {
     }
 
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gemini_tool_call_emits_function_call_and_response_done() {
+        let msg = serde_json::json!({
+            "toolCall": {
+                "functionCalls": [{
+                    "id": "call_1",
+                    "name": "search_installed_software",
+                    "args": {"keyword": "QQ音乐"}
+                }]
+            }
+        });
+
+        let events = parse_gemini_events(&msg);
+        assert_eq!(events.len(), 2);
+
+        match &events[0] {
+            WsEvent::FunctionCall {
+                call_id,
+                name,
+                arguments,
+            } => {
+                assert_eq!(call_id, "call_1");
+                assert_eq!(name, "search_installed_software");
+                assert!(arguments.contains("QQ音乐"));
+            }
+            _ => panic!("first event should be FunctionCall"),
+        }
+
+        assert!(matches!(events[1], WsEvent::ResponseDone));
+    }
+
+    #[test]
+    fn gemini_server_content_completion_emits_response_done() {
+        let msg = serde_json::json!({
+            "serverContent": {
+                "turnComplete": true,
+                "generationComplete": false
+            }
+        });
+
+        let events = parse_gemini_events(&msg);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], WsEvent::ResponseDone));
+    }
+
+    #[test]
+    fn gemini_user_transcription_emits_input_transcript() {
+        let msg = serde_json::json!({
+            "serverContent": {
+                "inputTranscription": {"text": "  hello there  "}
+            }
+        });
+
+        let events = parse_gemini_events(&msg);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            WsEvent::InputTranscript(text) => assert_eq!(text, "hello there"),
+            _ => panic!("expected InputTranscript"),
+        }
+    }
 }

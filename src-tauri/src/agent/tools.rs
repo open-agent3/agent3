@@ -481,9 +481,20 @@ pub async fn dispatch_ui_tool(app: &AppHandle, name: &str, args_json: &str) -> S
             match crate::system_api::search_installed_software(keyword) {
                 Ok(apps) => {
                     if apps.is_empty() {
-                        "No matching installed software found.".to_string()
+                        serde_json::json!({
+                            "status": "not_found",
+                            "message": "No matching installed software found.",
+                            "next_step": "Tell the user the app is not installed, offer one alternative playback option, and ask a concise follow-up question.",
+                        })
+                        .to_string()
                     } else {
-                        format!("Installed software found: {}", apps.join(", "))
+                        serde_json::json!({
+                            "status": "found",
+                            "count": apps.len(),
+                            "apps": apps,
+                            "next_step": "Tell the user what was found and ask whether to launch one of these apps.",
+                        })
+                        .to_string()
                     }
                 }
                 Err(e) => format!("Error searching installed software: {}", e),

@@ -521,7 +521,7 @@ async fn session_loop(
                 ConnectMode::SilentReconnect => InjectionScenario::SilentReconnect { max_turns: 3 },
                 ConnectMode::ToolRetry => InjectionScenario::ToolRetry {
                     max_turns: 3,
-                    retry_hint: "[System] Your previous response was interrupted because you tried to speak and call a tool at the same time. This time, ONLY execute the tool/function call silently — do NOT generate any spoken audio. After the tool result comes back, you may speak to the user.".to_string(),
+                    retry_hint: "[System] Retry mode is active due to a provider policy conflict (audio + tool in same turn). STRICT RULES: (1) execute tools only first, (2) produce no spoken/audio response before tool results are returned, (3) after receiving tool results, provide one concise spoken update to the user. If uncertain, prefer another tool step over speaking early.".to_string(),
                 },
                 ConnectMode::NewSession => {
                     let greeting = if !is_voice_onboarded {
@@ -541,6 +541,15 @@ async fn session_loop(
 
             let pack = injection_policy.build_pack(&memory, scenario).await;
             let encoded = memory_injection::encode_pack(protocol.as_ref(), &pack);
+
+            if connect_mode == ConnectMode::ToolRetry {
+                log::warn!(
+                    "[Session] ToolRetry injection active: retries={}, timeline_items={}, dropped_timeline_items={}",
+                    crash_1008_retries,
+                    encoded.timeline_items,
+                    encoded.dropped_timeline_items
+                );
+            }
 
             if encoded.timeline_items > 0 {
                 log::info!(
@@ -745,7 +754,7 @@ async fn session_loop(
                         .saturating_mul(2)
                         .min(16);
                     log::warn!(
-                        "[Session] Gemini 1008 crash (audio+tool conflict) — retrying with tool-only mode in {}s (attempt {}/{})",
+                        "[Session] Gemini 1008 crash (audio+tool conflict) — retrying with tool-only mode in {}s (attempt {}/{}, connect_mode=ToolRetry)",
                         backoff_secs,
                         crash_1008_retries,
                         MAX_1008_RETRIES
@@ -880,6 +889,11 @@ async fn run_event_loop(
                             log::info!("[Session] WebSocket closed: code={}, reason={}", f.code, f.reason);
                             // Gemini 1008 (Policy): audio + tool call conflict
                             if f.code == tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy {
+                                log::warn!(
+                                    "[Session] Policy close detected (likely audio+tool conflict): code={}, reason={}",
+                                    f.code,
+                                    f.reason
+                                );
                                 state.flush_user_transcript(memory).await;
                                 return LoopExit::Disconnected1008;
                             }
@@ -931,17 +945,41 @@ async fn run_event_loop(
 
                         // When all tools for this batch complete, trigger response generation
                         if state.tools_in_flight == 0 {
+                            // New provider turn starts after tool result callback.
+                            // Reset de-dup guard so the next ResponseDone is accepted.
+                            state.response_done_handled_for_turn = false;
                             state.consecutive_tool_rounds += 1;
                             if state.consecutive_tool_rounds >= MAX_TOOL_ROUNDS {
                                 log::warn!("[Session] Reached max tool rounds ({}), forcing final response", MAX_TOOL_ROUNDS);
                             } else {
                                 log::info!("[Session] Tool round {}/{} complete, triggering next response", state.consecutive_tool_rounds, MAX_TOOL_ROUNDS);
                             }
-                            if let Some(resp) = protocol.response_create_msg() {
+                            if let Some(resp) = protocol.tool_continuation_msg() {
+                                log::info!(
+                                    "[Session] Tool continuation signal sent (mode=provider_continuation, tools_in_flight={}, tool_round={})",
+                                    state.tools_in_flight,
+                                    state.consecutive_tool_rounds
+                                );
+                                if let Err(e) = ws_sink.send(Message::Text(resp.into())).await {
+                                    log::error!("[Session] Failed to send provider tool continuation: {}", e);
+                                    return LoopExit::Disconnected;
+                                }
+                            } else if let Some(resp) = protocol.response_create_msg() {
+                                log::info!(
+                                    "[Session] Tool continuation signal sent (mode=response_create, tools_in_flight={}, tool_round={})",
+                                    state.tools_in_flight,
+                                    state.consecutive_tool_rounds
+                                );
                                 if let Err(e) = ws_sink.send(Message::Text(resp.into())).await {
                                     log::error!("[Session] Failed to send response.create: {}", e);
                                     return LoopExit::Disconnected;
                                 }
+                            } else {
+                                log::warn!(
+                                    "[Session] No continuation signal available after tool batch (tools_in_flight={}, tool_round={})",
+                                    state.tools_in_flight,
+                                    state.consecutive_tool_rounds
+                                );
                             }
                         }
                     }
@@ -1331,7 +1369,22 @@ impl SessionLoopState {
                 }
                 realtime_ws::WsEvent::ResponseDone => {
                     if self.response_done_handled_for_turn {
-                        log::debug!("[Session] Ignoring duplicated ResponseDone in same turn");
+                        if !self.pending_tool_calls.is_empty() {
+                            log::warn!(
+                                "[Session] Duplicate ResponseDone received with {} pending tool calls — submitting anyway",
+                                self.pending_tool_calls.len()
+                            );
+                            let calls: Vec<task_manager::TaskRequest> =
+                                std::mem::take(&mut self.pending_tool_calls);
+                            self.tools_in_flight += calls.len();
+                            log::info!(
+                                "[Session] Submitting {} tool calls from duplicate ResponseDone",
+                                self.tools_in_flight
+                            );
+                            task_mgr.submit(calls);
+                        } else {
+                            log::debug!("[Session] Ignoring duplicated ResponseDone in same turn");
+                        }
                         continue;
                     }
                     self.response_done_handled_for_turn = true;
