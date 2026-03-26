@@ -46,7 +46,7 @@ tauri-plugin-updater = "2"
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-notification = "2"
 sqlx = { version = "0.8.6", features = ["sqlite", "runtime-tokio", "macros", "chrono", "uuid"] }
-keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native-sync-persistent", "crypto-rust"] }
 html2md = "0.2.15"
 select = "0.6.1"
 url = "2.5.8"

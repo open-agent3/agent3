@@ -275,15 +275,22 @@ pub async fn get_providers(state: tauri::State<'_, DbState>) -> Result<Vec<LlmPr
 
     let providers = rows
         .iter()
-        .map(|row| LlmProvider {
-            id: row.get(0),
-            name: row.get(1),
-            base_url: row.get(2),
-            api_key: row.get(3),
-            model: row.get(4),
-            is_active: row.get::<i64, _>(5) != 0,
-            provider_type: row.get(6),
-            role: row.get(7),
+        .map(|row| {
+            let api_key: String = row.get(3);
+            LlmProvider {
+                id: row.get(0),
+                name: row.get(1),
+                base_url: row.get(2),
+                api_key: if api_key == crate::keystore::KEYRING_SENTINEL {
+                    crate::keystore::KEYRING_SENTINEL.to_string()
+                } else {
+                    api_key
+                },
+                model: row.get(4),
+                is_active: row.get::<i64, _>(5) != 0,
+                provider_type: row.get(6),
+                role: row.get(7),
+            }
         })
         .collect();
 
@@ -296,6 +303,22 @@ pub async fn save_provider(
     provider: LlmProvider,
 ) -> Result<(), String> {
     let pool = &state.0;
+
+    // Determine what to store in DB for the api_key column.
+    // If the frontend sent back the sentinel (key unchanged), keep it as-is.
+    // Otherwise store the new key in the platform keyring and write the sentinel to DB.
+    let db_api_key = if provider.api_key.is_empty() || provider.api_key == crate::keystore::KEYRING_SENTINEL {
+        provider.api_key.clone()
+    } else {
+        match crate::keystore::store_key(&provider.id, &provider.api_key) {
+            Ok(()) => crate::keystore::KEYRING_SENTINEL.to_string(),
+            Err(e) => {
+                log::warn!("[DB] Cannot store key in keyring for '{}' ({}), keeping in DB", provider.id, e);
+                provider.api_key.clone()
+            }
+        }
+    };
+
     sqlx::query(
         "INSERT INTO llm_providers (id, name, base_url, api_key, model, is_active, provider_type, role)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -305,14 +328,14 @@ pub async fn save_provider(
            is_active=excluded.is_active, provider_type=excluded.provider_type, role=excluded.role,
            updated_at=datetime('now')"
     )
-    .bind(provider.id)
-    .bind(provider.name)
-    .bind(provider.base_url)
-    .bind(provider.api_key)
-    .bind(provider.model)
+    .bind(&provider.id)
+    .bind(&provider.name)
+    .bind(&provider.base_url)
+    .bind(&db_api_key)
+    .bind(&provider.model)
     .bind(provider.is_active as i64)
-    .bind(provider.provider_type)
-    .bind(provider.role)
+    .bind(&provider.provider_type)
+    .bind(&provider.role)
     .execute(pool)
     .await
     .map_err(|e| e.to_string())?;
@@ -323,8 +346,10 @@ pub async fn save_provider(
 #[tauri::command]
 pub async fn delete_provider(state: tauri::State<'_, DbState>, id: String) -> Result<(), String> {
     let pool = &state.0;
+    // Clean up keyring entry before deleting from DB
+    let _ = crate::keystore::delete_key(&id);
     sqlx::query("DELETE FROM llm_providers WHERE id = ?")
-        .bind(id)
+        .bind(&id)
         .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
