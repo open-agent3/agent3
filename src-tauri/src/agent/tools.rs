@@ -132,9 +132,29 @@ pub fn all_tools() -> Vec<ToolDef> {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "target": { "type": "string", "description": "URL (https://...) or absolute file path to open" }
+                    "target": { "type": "string", "description": "URL (https://...), URI scheme (spotify:, mailto:, etc.), or absolute file path to open to launch applications and media." }
                 },
                 "required": ["target"]
+            }),
+        },
+        ToolDef {
+            name: "read_clipboard",
+            description: "Read text from the user's OS clipboard.",
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        },
+        ToolDef {
+            name: "write_clipboard",
+            description: "Write text to the user's OS clipboard.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string", "description": "Text to write to the clipboard" }
+                },
+                "required": ["text"]
             }),
         },
         ToolDef {
@@ -331,6 +351,8 @@ pub fn is_ui_tool(name: &str) -> bool {
         name,
         "render_local_ui"
             | "open_external"
+            | "read_clipboard"
+            | "write_clipboard"
             | "set_agent_config"
             | "schedule_task"
             | "disconnect_session"
@@ -413,8 +435,19 @@ pub async fn dispatch_ui_tool(app: &AppHandle, name: &str, args_json: &str) -> S
             }
             log::info!("[Tools] Opening external: {}", target);
             match open::that(target) {
-                Ok(()) => format!("OK: Opened {}", target),
-                Err(e) => format!("Error opening {}: {}", target, e),
+                Ok(_) => format!("OK: Opened '{}'", target),
+                Err(e) => format!("Error opening '{}': {}", target, e),
+            }
+        }
+        "read_clipboard" => match crate::system_api::read_clipboard() {
+            Ok(content) => content,
+            Err(e) => format!("Error reading clipboard: {}", e),
+        },
+        "write_clipboard" => {
+            let text = args["text"].as_str().unwrap_or("");
+            match crate::system_api::write_clipboard(text.to_string()) {
+                Ok(_) => format!("OK: Copied '{}' to clipboard", text),
+                Err(e) => format!("Error writing clipboard: {}", e),
             }
         }
         "set_agent_config" => {
@@ -690,7 +723,7 @@ mod tests {
   #[test]
   fn all_tools_json_is_valid() {
     let tools = all_tools();
-    assert_eq!(tools.len(), 21, "Expected 21 tools");
+    assert_eq!(tools.len(), 23, "Expected 23 tools");
     for t in &tools {
         assert!(!t.name.is_empty(), "Tool name must not be empty");
         assert!(!t.description.is_empty(), "Tool description must not be empty");

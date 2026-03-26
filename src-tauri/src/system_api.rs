@@ -128,6 +128,12 @@ pub fn press_key(key: String) -> Result<(), String> {
         "f10" => Key::F10,
         "f11" => Key::F11,
         "f12" => Key::F12,
+        "mediaplaypause" | "playpause" => Key::MediaPlayPause,
+        "medianexttrack" | "nexttrack" => Key::MediaNextTrack,
+        "mediaprevtrack" | "prevtrack" => Key::MediaPrevTrack,
+        "volumeup" => Key::VolumeUp,
+        "volumedown" => Key::VolumeDown,
+        "volumemute" | "mute" => Key::VolumeMute,
         other => {
             if other.len() == 1 {
                 Key::Unicode(other.chars().next().unwrap())
@@ -211,4 +217,16 @@ pub fn capture_screen() -> Result<ScreenCapture, String> {
         width,
         height,
     })
+}
+
+#[tauri::command]
+pub fn read_clipboard() -> Result<String, String> {
+    let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+    clipboard.get_text().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn write_clipboard(text: String) -> Result<(), String> {
+    let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+    clipboard.set_text(text).map_err(|e| e.to_string())
 }
