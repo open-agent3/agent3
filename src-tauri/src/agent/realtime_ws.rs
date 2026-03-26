@@ -133,8 +133,8 @@ pub trait RealtimeProtocol: Send + Sync {
     /// Parse server WS message into unified event list
     fn parse_events(&self, raw: &str) -> Vec<WsEvent>;
 
-    /// Build inject-text-to-speech message
-    fn inject_speech_msg(&self, text: &str) -> String;
+    /// Build inject system directive message for immediate execution
+    fn inject_system_directive(&self, text: &str) -> String;
 
     /// Build tool call result message
     fn function_call_output_msg(&self, call_id: &str, name: &str, output: &str) -> String;
@@ -765,13 +765,13 @@ impl RealtimeProtocol for OpenAiProtocol {
         vec![parse_openai_event(&msg)]
     }
 
-    fn inject_speech_msg(&self, text: &str) -> String {
+    fn inject_system_directive(&self, text: &str) -> String {
         json!({
             "type": "response.create",
             "response": {
                 "modalities": ["text", "audio"],
                 "instructions": format!(
-                    "Paraphrase the following content to the user in concise, natural spoken language. Speak in {}. No lists or markdown — just say the key points:\n\n{}",
+                    "Execute this system directive immediately. Respond in {} using natural spoken language. No lists or markdown:\n\n{}",
                     crate::i18n::language_name(), text
                 ),
             },
@@ -909,13 +909,13 @@ impl RealtimeProtocol for GeminiProtocol {
         parse_gemini_events(&msg)
     }
 
-    fn inject_speech_msg(&self, text: &str) -> String {
+    fn inject_system_directive(&self, text: &str) -> String {
         json!({
             "clientContent": {
                 "turns": [{
                     "role": "user",
                     "parts": [{ "text": format!(
-                        "[System] Paraphrase the following content to the user in concise, natural spoken language:\n\n{}", text
+                        "[System Directive] Execute this system directive immediately. Respond using natural spoken language. No lists or markdown:\n\n{}", text
                     ) }]
                 }],
                 "turnComplete": true

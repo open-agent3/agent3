@@ -83,7 +83,7 @@ pub fn encode_pack(
 ) -> EncodedInjection {
     let mut messages = Vec::new();
     for prompt in &pack.speech_prompts {
-        messages.push(protocol.inject_speech_msg(prompt));
+        messages.push(protocol.inject_system_directive(prompt));
     }
 
     let mut dropped_timeline_items = 0;
@@ -100,7 +100,7 @@ pub fn encode_pack(
     if dropped_timeline_items > 0 && !protocol.supports_timeline_injection() {
         let brief = build_continuity_brief(&pack.timeline_items, pack.temporal_anchor.as_deref());
         if !brief.is_empty() {
-            messages.push(protocol.inject_speech_msg(&brief));
+            messages.push(protocol.inject_system_directive(&brief));
         }
     }
 
@@ -217,7 +217,7 @@ mod tests {
             Vec::new()
         }
 
-        fn inject_speech_msg(&self, text: &str) -> String {
+        fn inject_system_directive(&self, text: &str) -> String {
             format!("SPEECH:{}", text)
         }
 
@@ -255,7 +255,7 @@ mod tests {
             Vec::new()
         }
 
-        fn inject_speech_msg(&self, text: &str) -> String {
+        fn inject_system_directive(&self, text: &str) -> String {
             format!("SPEECH:{}", text)
         }
 

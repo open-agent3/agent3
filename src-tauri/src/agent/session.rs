@@ -952,7 +952,7 @@ async fn run_event_loop(
                 match inject_text {
                     Some(text) => {
                         log::info!("[Session] Injecting speech ({} chars)", text.len());
-                        let msg = protocol.inject_speech_msg(&text);
+                        let msg = protocol.inject_system_directive(&text);
                         if let Err(e) = ws_sink.send(Message::Text(msg.into())).await {
                             log::error!("[Session] Failed to inject speech: {}", e);
                             return LoopExit::Disconnected;
@@ -973,7 +973,7 @@ async fn run_event_loop(
                             "[System: To complete your current task, ask the user the following question naturally: {}]",
                             question
                         );
-                        let msg = protocol.inject_speech_msg(&prompt);
+                        let msg = protocol.inject_system_directive(&prompt);
                         if let Err(e) = ws_sink.send(Message::Text(msg.into())).await {
                             log::error!("[Session] Failed to inject subagent question: {}", e);
                             return LoopExit::Disconnected;
@@ -985,7 +985,7 @@ async fn run_event_loop(
                             "[System: The operation is complete. Tell the user exactly what was done based on this result: {}]",
                             summary
                         );
-                        let msg = protocol.inject_speech_msg(&prompt);
+                        let msg = protocol.inject_system_directive(&prompt);
                         if let Err(e) = ws_sink.send(Message::Text(msg.into())).await {
                             log::error!("[Session] Failed to inject subagent completion: {}", e);
                             return LoopExit::Disconnected;
@@ -997,7 +997,7 @@ async fn run_event_loop(
                             "[System: The operation failed with error: {}. Apologize and explain briefly. DO NOT mention 'subagent' or 'background task'.]",
                             error
                         );
-                        let msg = protocol.inject_speech_msg(&prompt);
+                        let msg = protocol.inject_system_directive(&prompt);
                         if let Err(e) = ws_sink.send(Message::Text(msg.into())).await {
                             log::error!("[Session] Failed to inject subagent failure: {}", e);
                             return LoopExit::Disconnected;
@@ -1388,7 +1388,7 @@ impl SessionLoopState {
                             "SYSTEM: The user just interrupted you. Your last partial sentence was '{}'. Please listen to what they say next and respond naturally.",
                             partial
                         );
-                        let inject_msg = protocol.inject_speech_msg(&sys_msg);
+                        let inject_msg = protocol.inject_system_directive(&sys_msg);
                         replies.push(inject_msg);
                         // Clear the buffer since it was interrupted
                         self.transcript_buf.clear();
