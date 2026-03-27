@@ -1,4 +1,4 @@
-# Agent3 — Project Handoff Document
+# Agent3
 
 > **Inspiration**: The movie "Her" — an invisible, ambient system-level AI agent
 > **Tech Stack**: Tauri 2.0 + Vue 3 + TypeScript + Rust + SQLite + Realtime API + tokio-tungstenite + cpal + reqwest + rustpotter

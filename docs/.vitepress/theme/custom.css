@@ -1,0 +1,109 @@
+:root {
+  /* ================================================= */
+  /*  VitePress Native Theme Overrides (Light & Dark)    */
+  /* ================================================= */
+  
+  /* Font Families: Force modern sleek sans-serif */
+  --vp-font-family-base: "Inter", "SF Pro Display", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --vp-font-family-mono: "JetBrains Mono", "SF Mono", "Fira Code", "Roboto Mono", Consolas, monospace;
+
+  /* Accent Color: Deep Orange / Pink inspired by the Her orb */
+  --vp-c-brand-1: #FF512F;
+  --vp-c-brand-2: #FF6935;
+  --vp-c-brand-3: #FF8550;
+  --vp-c-brand-soft: rgba(255, 81, 47, 0.1);
+
+  /* Buttons in doc pages */
+  --vp-button-brand-bg: var(--vp-c-brand-1);
+  --vp-button-brand-text: #fff;
+  --vp-button-brand-hover-bg: var(--vp-c-brand-2);
+  
+  --vp-button-alt-bg: transparent;
+  --vp-button-alt-hover-bg: rgba(0, 0, 0, 0.05);
+
+  /* Layout Width: Make text more legible and allow wider code/images */
+  --vp-layout-max-width: 1440px; 
+}
+
+/* 
+  DARK MODE SPECIFIC OVERRIDES
+  Vitepress dynamically adds `.dark` class to html
+*/
+.dark {
+  /* Strict Oled Black Backgrounds */
+  --vp-c-bg: #000000;
+  --vp-c-bg-alt: #0a0a0a;
+  --vp-c-bg-soft: #111111;
+  --vp-c-bg-elv: #151515;
+
+  /* Subtle neutral grays for text */
+  --vp-c-text-1: rgba(255, 255, 255, 0.85);
+  --vp-c-text-2: rgba(255, 255, 255, 0.6);
+  --vp-c-text-3: rgba(255, 255, 255, 0.4);
+
+  --vp-button-alt-hover-bg: rgba(255, 255, 255, 0.05);
+
+  /* Transparent Navs */
+  --vp-nav-bg-color: rgba(0, 0, 0, 0.8);
+}
+
+/* Hide navigation entirely on Home page if layout is page and contains hero */
+.VPNav.home {
+  display: none !important;
+}
+
+/* Force dark mode behavior ONLY on Home page hero */
+.home-page-env {
+  background-color: #000;
+  color: rgba(255, 255, 255, 0.9);
+}
+
+/* Allow appearance toggle button to show up again everywhere except custom home layout */
+/* Removing the display: none !important for VPSwitchAppearance */
+
+/* Override default page styling for the Home Hero container */
+.VPHome {
+  margin-top: 0 !important;
+  padding-top: 0 !important;
+}
+
+/* ======================================================== */
+/* DOCS BEAUTIFICATION: Premium glassmorphism and spacing   */
+/* ======================================================== */
+
+/* Premium Code Blocks Setup - Dark Mode Only */
+.dark div[class*="language-"] {
+  background-color: var(--vp-c-bg-soft) !important;
+  border: 1px solid rgba(255, 255, 255, 0.1) !important;
+  border-radius: 12px;
+  box-shadow: inset 0 1px 3px rgba(0,0,0,0.5);
+}
+
+/* Titles and Headings typography polish */
+h1, h2, h3, h4, h5, h6 {
+  letter-spacing: -0.02em;
+  font-weight: 600 !important;
+}
+
+/* Mermaid / Image adaptive inversion for Dark Mode */
+.vp-doc img {
+  border-radius: 8px;
+}
+.dark .vp-doc img[src$=".svg"] {
+  filter: drop-shadow(0px 0px 5px rgba(255,255,255,0.2));
+}
+
+/* Sidebar Styling: cleaner background */
+.dark .VPSidebar {
+  background-color: var(--vp-c-bg) !important;
+  border-right: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+/* Enhance inline code fragments */
+.vp-doc code {
+  color: var(--vp-c-brand-2) !important;
+  font-size: 0.9em;
+}
+.dark .vp-doc code {
+  background-color: rgba(255, 255, 255, 0.1) !important;
+}
