@@ -7,7 +7,19 @@
 
 > 一个自然、快速、始终贴近你身边的系统级环境式 AI 语音助手。
 
+🌐 **[访问官方网站与下载页面](https://open-agent3.github.io/agent3/)**
+
 **当前状态**: Public Alpha (`v0.1.x`)
+
+## 📥 下载与安装
+
+对于普通用户，你无需配置任何代码环境。直接前往官网下载对应操作系统的安装包即可：
+
+**[👉 获取 Agent3 (支持 Windows / macOS / Linux)](https://open-agent3.github.io/agent3/)**
+
+> **注**：安装完成后，应用会在系统托盘运行。初次使用时，你需要自备并填入 API Key（OpenAI 或 Gemini）才能唤醒它。
+
+---
 
 ## ✨ 人人都能上手
 

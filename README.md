@@ -7,7 +7,19 @@
 
 > A system-level ambient AI voice agent that feels natural, fast, and close at hand.
 
+🌐 **[Visit the Official Website & Download](https://open-agent3.github.io/agent3/)**
+
 **Status**: Public Alpha (`v0.1.x`)
+
+## 📥 Installation
+
+For average users, you don't need to touch any code. Just download the installer for your operating system:
+
+**[👉 Get Agent3 for Windows / macOS / Linux](https://open-agent3.github.io/agent3/)**
+
+> **Note**: After installation, you will need to provide your own API key (OpenAI or Gemini) in the tray settings to start using the voice agent.
+
+---
 
 ## ✨ Built For Everyone
 
