@@ -4,6 +4,7 @@ export default defineConfig({
   title: "Agent3",
   description: "The system-level ambient voice agent. Inspired by Her.",
   appearance: "dark",
+  base: "/agent3/",
   
   themeConfig: {
     nav: [
